@@ -31,11 +31,6 @@ const STATE_SCHEMA_VERSION = 1;
 export interface Config {
   compactAtPercent: number;
   nativeFallbackPercent: number;
-  reevaluateMidPercent: number;
-  reevaluateUrgentPercent: number;
-  reevaluateLowResultPercent: number;
-  reevaluateMidResultPercent: number;
-  reevaluateUrgentResultPercent: number;
   minReductionRatio: number;
   keepThreshold: number;
   preserveRecentMessages: number;
@@ -57,11 +52,6 @@ export interface Config {
 const DEFAULTS: Config = {
   compactAtPercent: 75,
   nativeFallbackPercent: 87.5,
-  reevaluateMidPercent: 80,
-  reevaluateUrgentPercent: 84,
-  reevaluateLowResultPercent: 3,
-  reevaluateMidResultPercent: 1.5,
-  reevaluateUrgentResultPercent: 0,
   minReductionRatio: 0.01,
   keepThreshold: 0.5,
   preserveRecentMessages: 6,
@@ -208,33 +198,11 @@ export function resolveConfig(): Config {
     Math.floor(envNumber("PI_JEV_EVALUATION_TIMEOUT_MS", DEFAULTS.evaluationTimeoutMs)),
   );
   const compactAtPercent = envNumber("PI_JEV_COMPACT_AT_PERCENT", DEFAULTS.compactAtPercent);
-  const reevaluateMidPercent = Math.max(
-    compactAtPercent,
-    envNumber("PI_JEV_REEVALUATE_MID_PERCENT", DEFAULTS.reevaluateMidPercent),
-  );
-  const reevaluateUrgentPercent = Math.max(
-    reevaluateMidPercent,
-    envNumber("PI_JEV_REEVALUATE_URGENT_PERCENT", DEFAULTS.reevaluateUrgentPercent),
-  );
   const config: Config = {
     compactAtPercent,
     nativeFallbackPercent: Math.max(
-      reevaluateUrgentPercent,
+      compactAtPercent,
       envNumber("PI_JEV_NATIVE_FALLBACK_PERCENT", DEFAULTS.nativeFallbackPercent),
-    ),
-    reevaluateMidPercent,
-    reevaluateUrgentPercent,
-    reevaluateLowResultPercent: Math.max(
-      0,
-      envNumber("PI_JEV_REEVALUATE_LOW_RESULT_PERCENT", DEFAULTS.reevaluateLowResultPercent),
-    ),
-    reevaluateMidResultPercent: Math.max(
-      0,
-      envNumber("PI_JEV_REEVALUATE_MID_RESULT_PERCENT", DEFAULTS.reevaluateMidResultPercent),
-    ),
-    reevaluateUrgentResultPercent: Math.max(
-      0,
-      envNumber("PI_JEV_REEVALUATE_URGENT_RESULT_PERCENT", DEFAULTS.reevaluateUrgentResultPercent),
     ),
     minReductionRatio: envNumber("PI_JEV_MIN_REDUCTION_RATIO", DEFAULTS.minReductionRatio),
     keepThreshold: envNumber("PI_JEV_KEEP_THRESHOLD", DEFAULTS.keepThreshold),
@@ -741,11 +709,8 @@ function toolResultTokenVolume(
 function evaluationPolicy(config: Config): TurnEndEvaluationPolicy {
   return {
     triggerPercent: config.compactAtPercent,
-    midPercent: config.reevaluateMidPercent,
-    urgentPercent: config.reevaluateUrgentPercent,
-    lowPressureResultPercent: config.reevaluateLowResultPercent,
-    midPressureResultPercent: config.reevaluateMidResultPercent,
-    urgentResultPercent: config.reevaluateUrgentResultPercent,
+    fallbackPercent: config.nativeFallbackPercent,
+    minReductionRatio: config.minReductionRatio,
   };
 }
 
