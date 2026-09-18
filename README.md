@@ -4,6 +4,21 @@ A Pi package port of [`tamaratran/fast-jev-compaction`](https://github.com/tamar
 
 It uses TypeSafe Jev to decide, tool call by tool call, which old calls/results still need to remain in model context. User and assistant prose is not summarized or rewritten by this extension. Pi's persisted session transcript stays intact.
 
+## 0.6.4: keep logical fallback through transient Jev failures
+
+0.6.4 fixes the premature native compactions observed in the first clean 0.6.3 run.
+
+A Jev timeout/backoff/circuit-breaker event no longer invalidates already-committed logical pruning. If the extension is enabled, the API key exists, and there are committed logical decisions, Pi threshold compaction continues to be cancelled while the calibrated logical context remains below the configured native fallback boundary.
+
+This preserves the intended distinction:
+
+- **remote refresh health** decides whether Jev can score more tool results right now;
+- **logical history validity** decides whether Pi still has to native-compact right now.
+
+Before any logical decisions have been committed, the package keeps the old fail-open behavior: if Jev is unavailable, Pi native compaction is not delayed.
+
+The normal 0.5 scheduling/pruning behavior restored in 0.6.3 is unchanged.
+
 ## 0.6.3: restore the 0.5 control behavior
 
 0.6.3 deliberately rolls the active-run behavior back to the known-good 0.5.0 control after the 0.6.x grounding/read-retention experiments caused reconnaissance loops and frequent native compaction.
