@@ -56,7 +56,7 @@ test("defaults keep only trigger/fallback/min-reduction policy knobs", () => {
 
 test("drop_result uses an explicit pruned marker without retaining a source prefix", () => {
   assert.match(source, /result pruned/);
-  assert.match(source, /contents unavailable even if earlier reasoning mentions them/);
+  assert.match(source, /re-run this tool before relying on its output/);
   assert.doesNotMatch(source, /truncateResultText/);
   assert.doesNotMatch(source, /PI_JEV_TRUNCATE_HEAD_CHARS/);
   assert.doesNotMatch(source, /text\.slice\(0,\s*headChars\)/);
