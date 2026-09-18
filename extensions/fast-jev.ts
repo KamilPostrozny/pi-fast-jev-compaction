@@ -634,6 +634,9 @@ function restoreLogicalState(
 
   state.decisions = restored;
   state.deferredDropCalls.clear();
+  state.lastEvaluatedEligibleIds.clear();
+  state.lastNewEligibleResultTokens = undefined;
+  state.lastRequiredNewResultTokens = undefined;
   state.restoredDecisionCount = restored.size;
   state.lastResult = undefined;
   state.lastEffectiveReduction = undefined;
@@ -656,8 +659,35 @@ function eligibleToolIds(calls: readonly JevToolCall[]): Set<string> {
   return new Set(calls.filter((call) => !call.pinned).map((call) => call.tool_use_id));
 }
 
-function hasUnscoredEligibleCall(calls: readonly JevToolCall[], state: RuntimeState): boolean {
-  return calls.some((call) => !call.pinned && !state.decisions.has(call.tool_use_id));
+function newEligibleToolIds(
+  eligibleIds: ReadonlySet<string>,
+  lastEvaluatedIds: ReadonlySet<string>,
+): Set<string> {
+  return new Set([...eligibleIds].filter((id) => !lastEvaluatedIds.has(id)));
+}
+
+function toolResultTokenVolume(
+  messages: readonly JevMessage[],
+  ids: ReadonlySet<string>,
+): number {
+  let total = 0;
+  for (const message of messages) {
+    for (const result of message.toolResults ?? []) {
+      if (ids.has(result.tool_use_id)) total += estimateTokens(result.text);
+    }
+  }
+  return total;
+}
+
+function evaluationPolicy(config: Config): TurnEndEvaluationPolicy {
+  return {
+    triggerPercent: config.compactAtPercent,
+    midPercent: config.reevaluateMidPercent,
+    urgentPercent: config.reevaluateUrgentPercent,
+    lowPressureResultTokens: config.reevaluateLowResultTokens,
+    midPressureResultTokens: config.reevaluateMidResultTokens,
+    urgentResultTokens: config.reevaluateUrgentResultTokens,
+  };
 }
 
 function errorText(error: unknown): string {
@@ -1540,6 +1570,9 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
     state.lastError = undefined;
     state.lastResult = undefined;
     state.pendingReductionTokens = 0;
+    state.lastEvaluatedEligibleIds.clear();
+    state.lastNewEligibleResultTokens = undefined;
+    state.lastRequiredNewResultTokens = undefined;
     state.restoredDecisionCount = 0;
     persistLogicalState(pi, diagnostics, state, "native_compaction_tail");
     diagnostics.record("session_compact", {
