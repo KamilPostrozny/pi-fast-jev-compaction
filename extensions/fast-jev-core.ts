@@ -1,5 +1,5 @@
 /*
- * Vendored/adapted from tamaratran/fast-jev-compaction v0.2.0 (MIT).
+ * Vendored/adapted from tamaratran/fast-jev-compaction v0.3.0 (MIT).
  * Original project: https://github.com/tamaratran/fast-jev-compaction
  * See THIRD_PARTY_LICENSES.md.
  */
