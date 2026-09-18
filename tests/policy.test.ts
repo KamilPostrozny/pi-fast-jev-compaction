@@ -12,11 +12,8 @@ import {
 
 const policy: TurnEndEvaluationPolicy = {
   triggerPercent: 75,
-  midPercent: 80,
-  urgentPercent: 84,
-  lowPressureResultPercent: 3,
-  midPressureResultPercent: 1.5,
-  urgentResultPercent: 0,
+  fallbackPercent: 87.5,
+  minReductionRatio: 0.01,
 };
 
 test("small but useful Jev reductions are accepted", () => {
@@ -52,24 +49,30 @@ test("calibrated pressure uses the more conservative logical/provider signal", (
   );
 });
 
-test("result-volume gates scale with context window instead of fixed token counts", () => {
+test("reevaluation volume scales with context size through min reduction", () => {
   for (const window of [32_768, 65_536, 131_072]) {
     assert.equal(
       requiredNewResultTokens(75, window, policy),
-      Math.ceil(window * 0.03),
+      Math.ceil(window * 0.01),
     );
-    assert.equal(
-      requiredNewResultTokens(82, window, policy),
-      Math.ceil(window * 0.015),
-    );
-    assert.equal(requiredNewResultTokens(84, window, policy), 1);
   }
+});
 
-  assert.equal(requiredNewResultTokens(74.9, 65_536, policy), null);
+test("reevaluation gate tightens continuously to remaining native headroom", () => {
+  const window = 65_536;
+  assert.equal(requiredNewResultTokens(74.9, window, policy), null);
+  assert.equal(requiredNewResultTokens(80, window, policy), Math.ceil(window * 0.01));
+
+  const nearFallback = 87.4;
+  const expectedHeadroom = Math.ceil(window * (87.5 - nearFallback) / 100);
+  assert.equal(requiredNewResultTokens(nearFallback, window, policy), expectedHeadroom);
+
+  assert.equal(requiredNewResultTokens(87.5, window, policy), 1);
+  assert.equal(requiredNewResultTokens(90, window, policy), 1);
   assert.equal(requiredNewResultTokens(80, undefined, policy), null);
 });
 
-test("first Jev pass runs at 75% regardless of accumulated result volume", () => {
+test("first Jev pass runs at trigger regardless of accumulated result volume", () => {
   assert.equal(
     shouldEvaluateAtTurnEnd({
       pressurePercent: 75,
@@ -85,10 +88,9 @@ test("first Jev pass runs at 75% regardless of accumulated result volume", () =>
   );
 });
 
-test("later Jev passes use context-relative new-result volume", () => {
+test("later Jev passes use the derived context-relative gate", () => {
   const window = 65_536;
-  const lowRequired = Math.ceil(window * 0.03);
-  const midRequired = Math.ceil(window * 0.015);
+  const required = Math.ceil(window * 0.01);
 
   assert.equal(
     shouldEvaluateAtTurnEnd({
@@ -98,7 +100,7 @@ test("later Jev passes use context-relative new-result volume", () => {
       eligibleCalls: 20,
       previouslyEvaluatedCalls: 10,
       newEligibleCalls: 2,
-      newEligibleResultTokens: lowRequired - 1,
+      newEligibleResultTokens: required - 1,
       policy,
     }),
     false,
@@ -111,33 +113,20 @@ test("later Jev passes use context-relative new-result volume", () => {
       eligibleCalls: 20,
       previouslyEvaluatedCalls: 10,
       newEligibleCalls: 2,
-      newEligibleResultTokens: lowRequired,
+      newEligibleResultTokens: required,
       policy,
     }),
     true,
   );
   assert.equal(
     shouldEvaluateAtTurnEnd({
-      pressurePercent: 82,
+      pressurePercent: 87.49,
       contextWindow: window,
       forceRefresh: false,
       eligibleCalls: 20,
       previouslyEvaluatedCalls: 10,
       newEligibleCalls: 1,
-      newEligibleResultTokens: midRequired,
-      policy,
-    }),
-    true,
-  );
-  assert.equal(
-    shouldEvaluateAtTurnEnd({
-      pressurePercent: 84,
-      contextWindow: window,
-      forceRefresh: false,
-      eligibleCalls: 20,
-      previouslyEvaluatedCalls: 10,
-      newEligibleCalls: 1,
-      newEligibleResultTokens: 1,
+      newEligibleResultTokens: 7,
       policy,
     }),
     true,
