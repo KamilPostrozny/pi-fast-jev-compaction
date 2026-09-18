@@ -45,9 +45,19 @@ test("agent_end promotes deferred full deletions only after clean stop", () => {
   assert.match(block, /deferredDropCalls\.clear\(\)/);
 });
 
-test("defaults leave a gap between Jev and native fallback", () => {
-  assert.match(source, /compactAtPercent:\s*80/);
+test("defaults leave a wider gap between Jev and native fallback", () => {
+  assert.match(source, /compactAtPercent:\s*75/);
+  assert.match(source, /reevaluateMidPercent:\s*80/);
+  assert.match(source, /reevaluateUrgentPercent:\s*84/);
   assert.match(source, /nativeFallbackPercent:\s*87\.5/);
+  assert.match(source, /minReductionRatio:\s*0\.01/);
+});
+
+test("drop_result uses an explicit pruned marker without retaining a source prefix", () => {
+  assert.match(source, /result pruned/);
+  assert.doesNotMatch(source, /truncateResultText/);
+  assert.doesNotMatch(source, /PI_JEV_TRUNCATE_HEAD_CHARS/);
+  assert.doesNotMatch(source, /text\.slice\(0,\s*headChars\)/);
 });
 
 test("Pi adapter TypeScript parses after type stripping", () => {
