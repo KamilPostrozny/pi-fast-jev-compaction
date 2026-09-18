@@ -1135,11 +1135,13 @@ async function evaluateAtTurnEnd(
     if (!rawIds.has(id)) state.lastEvaluatedEligibleIds.delete(id);
   }
 
-  const logicalBefore = applyDecisionsDetailed(
+  const appliedBefore = applyDecisionsDetailed(
     rawMessages,
     state.decisions,
     decisionIds(state.decisions),
-  ).messages;
+  );
+  const logicalBefore = appliedBefore.messages;
+  const modelFacingBefore = appendGroundingReminder(logicalBefore, appliedBefore.stats);
   const projection = projectMessages(logicalBefore);
   const calls = collectToolCalls(
     projection.messages,
@@ -1153,7 +1155,8 @@ async function evaluateAtTurnEnd(
   const newEligibleIds = newEligibleToolIds(eligibleNow, state.lastEvaluatedEligibleIds);
   const newEligibleResultTokens = toolResultTokenVolume(projection.messages, newEligibleIds);
 
-  const logicalTokens = rawTokenEstimate(projection.messages, ctx);
+  const modelFacingProjection = projectMessages(modelFacingBefore);
+  const logicalTokens = rawTokenEstimate(modelFacingProjection.messages, ctx);
   const pressure = pressureSnapshot(logicalTokens, ctx, state);
   const contextWindow = pressure.contextWindow;
   const logicalPercent = pressure.logicalPercent ?? null;
