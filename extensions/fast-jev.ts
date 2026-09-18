@@ -1056,29 +1056,10 @@ function logicalContextAtCompaction(
   ).messages;
   const projection = projectMessages(logical);
   const tokens = rawTokenEstimate(projection.messages, ctx);
-  const usage = ctx.getContextUsage();
-  const contextWindow = usage?.contextWindow ?? ctx.model?.contextWindow;
-  const estimatedPercent =
-    contextWindow && contextWindow > 0 ? (tokens / contextWindow) * 100 : null;
-  const adjustedUsagePercent =
-    usage?.tokens !== null &&
-    usage?.tokens !== undefined &&
-    contextWindow &&
-    contextWindow > 0
-      ? (Math.max(0, usage.tokens - state.pendingReductionTokens) / contextWindow) * 100
-      : usage?.percent ?? null;
-  // Calibrate the local estimate against Pi's provider-backed usage while
-  // subtracting only pruning committed after that usage measurement.
-  const percent =
-    adjustedUsagePercent === null || adjustedUsagePercent === undefined
-      ? estimatedPercent
-      : estimatedPercent === null
-        ? adjustedUsagePercent
-        : Math.max(adjustedUsagePercent, estimatedPercent);
   return {
     tokens,
     messages: logical.length,
-    percent,
+    percent: pressureSnapshot(tokens, ctx, state).pressurePercent,
   };
 }
 
