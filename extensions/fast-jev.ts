@@ -948,20 +948,17 @@ function sanitizeCompactionPreparation(
   },
   branchEntries: readonly unknown[],
   decisions: ReadonlyMap<string, CachedDecision>,
-  truncateHeadChars: number,
 ): ApplyStats {
   const ids = decisionIds(decisions);
   const history = applyDecisionsDetailed(
     preparation.messagesToSummarize,
     decisions,
     ids,
-    truncateHeadChars,
   );
   const prefix = applyDecisionsDetailed(
     preparation.turnPrefixMessages,
     decisions,
     ids,
-    truncateHeadChars,
   );
 
   preparation.messagesToSummarize = history.messages;
@@ -974,7 +971,7 @@ function sanitizeCompactionPreparation(
   return {
     droppedCalls: history.stats.droppedCalls + prefix.stats.droppedCalls,
     droppedResults: history.stats.droppedResults + prefix.stats.droppedResults,
-    truncatedResults: history.stats.truncatedResults + prefix.stats.truncatedResults,
+    prunedResults: history.stats.prunedResults + prefix.stats.prunedResults,
     messagesBefore: history.stats.messagesBefore + prefix.stats.messagesBefore,
     messagesAfter: history.stats.messagesAfter + prefix.stats.messagesAfter,
   };
@@ -983,14 +980,12 @@ function sanitizeCompactionPreparation(
 function logicalContextAtCompaction(
   ctx: ExtensionContext,
   state: RuntimeState,
-  truncateHeadChars: number,
 ): { tokens: number; messages: number; percent: number | null } {
   const raw = ctx.sessionManager.buildSessionContext().messages;
   const logical = applyDecisionsDetailed(
     raw,
     state.decisions,
     decisionIds(state.decisions),
-    truncateHeadChars,
   ).messages;
   const projection = projectMessages(logical);
   const tokens = rawTokenEstimate(projection.messages, ctx);
