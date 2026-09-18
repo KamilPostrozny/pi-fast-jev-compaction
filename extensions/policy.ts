@@ -4,9 +4,17 @@ export interface TurnEndEvaluationPolicy {
   triggerPercent: number;
   midPercent: number;
   urgentPercent: number;
-  lowPressureResultTokens: number;
-  midPressureResultTokens: number;
-  urgentResultTokens: number;
+  lowPressureResultPercent: number;
+  midPressureResultPercent: number;
+  urgentResultPercent: number;
+}
+
+export interface CalibratedPressureInput {
+  logicalTokens: number;
+  contextWindow: number | null | undefined;
+  providerTokens?: number | null;
+  providerPercent?: number | null;
+  pendingReductionTokens?: number;
 }
 
 export function acceptsReduction(ratio: number, minimum: number): boolean {
@@ -22,29 +30,92 @@ export function activeRunAction(action: CallAction): CallAction {
   return action === "drop_call" ? "drop_result" : action;
 }
 
+/**
+ * One conservative pressure signal used everywhere in the adapter.
+ *
+ * Pi's last provider usage can lag behind a freshly-pruned logical context, so
+ * subtract only reductions committed after that measurement. The local logical
+ * estimate catches growth that Pi's provider-backed number has not reflected
+ * yet. Taking the larger of the two prevents the scheduler and native fallback
+ * from disagreeing about how full the context is.
+ */
+export function calibratedPressurePercent(input: CalibratedPressureInput): number | null {
+  const contextWindow = input.contextWindow;
+  if (!contextWindow || !Number.isFinite(contextWindow) || contextWindow <= 0) {
+    const providerPercent = input.providerPercent;
+    return providerPercent !== null &&
+      providerPercent !== undefined &&
+      Number.isFinite(providerPercent)
+      ? providerPercent
+      : null;
+  }
+
+  const estimatedPercent =
+    Number.isFinite(input.logicalTokens) && input.logicalTokens >= 0
+      ? (input.logicalTokens / contextWindow) * 100
+      : null;
+
+  let providerAdjustedPercent: number | null = null;
+  if (
+    input.providerTokens !== null &&
+    input.providerTokens !== undefined &&
+    Number.isFinite(input.providerTokens)
+  ) {
+    const pending = Math.max(0, input.pendingReductionTokens ?? 0);
+    providerAdjustedPercent =
+      (Math.max(0, input.providerTokens - pending) / contextWindow) * 100;
+  } else if (
+    input.providerPercent !== null &&
+    input.providerPercent !== undefined &&
+    Number.isFinite(input.providerPercent)
+  ) {
+    providerAdjustedPercent = input.providerPercent;
+  }
+
+  if (estimatedPercent === null) return providerAdjustedPercent;
+  if (providerAdjustedPercent === null) return estimatedPercent;
+  return Math.max(estimatedPercent, providerAdjustedPercent);
+}
+
+function resultPercentForPressure(
+  pressurePercent: number,
+  policy: TurnEndEvaluationPolicy,
+): number {
+  if (pressurePercent >= policy.urgentPercent) return policy.urgentResultPercent;
+  if (pressurePercent >= policy.midPercent) return policy.midPressureResultPercent;
+  return policy.lowPressureResultPercent;
+}
+
 export function requiredNewResultTokens(
-  effectivePercent: number | null,
+  pressurePercent: number | null,
+  contextWindow: number | null | undefined,
   policy: TurnEndEvaluationPolicy,
 ): number | null {
   if (
-    effectivePercent === null ||
-    !Number.isFinite(effectivePercent) ||
-    effectivePercent < policy.triggerPercent
+    pressurePercent === null ||
+    !Number.isFinite(pressurePercent) ||
+    pressurePercent < policy.triggerPercent ||
+    !contextWindow ||
+    !Number.isFinite(contextWindow) ||
+    contextWindow <= 0
   ) {
     return null;
   }
-  if (effectivePercent >= policy.urgentPercent) return policy.urgentResultTokens;
-  if (effectivePercent >= policy.midPercent) return policy.midPressureResultTokens;
-  return policy.lowPressureResultTokens;
+
+  const fraction = Math.max(0, resultPercentForPressure(pressurePercent, policy)) / 100;
+  // "0%" means any non-empty new eligible result is enough.
+  return Math.max(1, Math.ceil(contextWindow * fraction));
 }
 
 /**
  * The first pass runs as soon as the trigger is crossed. Later passes are
- * driven by NEW eligible tool-result volume, with progressively lower
- * thresholds as native compaction gets closer.
+ * driven by NEW eligible tool-result volume. The volume gates are percentages
+ * of the current model's context window, so a 32k, 64k, or 128k model gets the
+ * same policy rather than the same absolute token count.
  */
 export function shouldEvaluateAtTurnEnd(args: {
-  effectivePercent: number | null;
+  pressurePercent: number | null;
+  contextWindow: number | null | undefined;
   forceRefresh: boolean;
   eligibleCalls: number;
   previouslyEvaluatedCalls: number;
@@ -53,7 +124,8 @@ export function shouldEvaluateAtTurnEnd(args: {
   policy: TurnEndEvaluationPolicy;
 }): boolean {
   const {
-    effectivePercent,
+    pressurePercent,
+    contextWindow,
     forceRefresh,
     eligibleCalls,
     previouslyEvaluatedCalls,
@@ -65,7 +137,7 @@ export function shouldEvaluateAtTurnEnd(args: {
   if (eligibleCalls <= 0) return false;
   if (forceRefresh) return true;
 
-  const required = requiredNewResultTokens(effectivePercent, policy);
+  const required = requiredNewResultTokens(pressurePercent, contextWindow, policy);
   if (required === null) return false;
 
   // First pressure-triggered evaluation in this logical-history segment.
@@ -81,12 +153,12 @@ export function shouldEvaluateAtTurnEnd(args: {
  * available. A broken/missing Jev must never disable Pi's safety net.
  */
 export function shouldDelayNativeThreshold(
-  logicalPercent: number | null,
+  pressurePercent: number | null,
   fallbackPercent: number,
   jevHealthy: boolean,
 ): boolean {
   return jevHealthy &&
-    logicalPercent !== null &&
-    Number.isFinite(logicalPercent) &&
-    logicalPercent < fallbackPercent;
+    pressurePercent !== null &&
+    Number.isFinite(pressurePercent) &&
+    pressurePercent < fallbackPercent;
 }
