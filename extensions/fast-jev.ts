@@ -800,6 +800,69 @@ function breakerActive(state: RuntimeState): boolean {
   return Date.now() < state.breakerUntilMs;
 }
 
+function sanitizeCompactionPreparation(
+  preparation: {
+    messagesToSummarize: AgentMessage[];
+    turnPrefixMessages: AgentMessage[];
+    fileOps: ReturnType<typeof createFileOps>;
+  },
+  decisions: ReadonlyMap<string, CachedDecision>,
+  truncateHeadChars: number,
+): ApplyStats {
+  const ids = decisionIds(decisions);
+  const history = applyDecisionsDetailed(
+    preparation.messagesToSummarize,
+    decisions,
+    ids,
+    truncateHeadChars,
+  );
+  const prefix = applyDecisionsDetailed(
+    preparation.turnPrefixMessages,
+    decisions,
+    ids,
+    truncateHeadChars,
+  );
+
+  preparation.messagesToSummarize = history.messages;
+  preparation.turnPrefixMessages = prefix.messages;
+
+  // Pi appends file-operation metadata to its summary. Rebuild it from the
+  // sanitized messages so a dropped tool call cannot leak back via a filename.
+  const fileOps = createFileOps();
+  for (const message of [...history.messages, ...prefix.messages]) {
+    extractFileOpsFromMessage(message, fileOps);
+  }
+  preparation.fileOps = fileOps;
+
+  return {
+    droppedCalls: history.stats.droppedCalls + prefix.stats.droppedCalls,
+    droppedResults: history.stats.droppedResults + prefix.stats.droppedResults,
+    truncatedResults: history.stats.truncatedResults + prefix.stats.truncatedResults,
+    messagesBefore: history.stats.messagesBefore + prefix.stats.messagesBefore,
+    messagesAfter: history.stats.messagesAfter + prefix.stats.messagesAfter,
+  };
+}
+
+function logicalContextAtCompaction(
+  branchEntries: Parameters<typeof buildSessionContext>[0],
+  ctx: ExtensionContext,
+  state: RuntimeState,
+  truncateHeadChars: number,
+): { tokens: number; messages: number } {
+  const raw = buildSessionContext(branchEntries).messages;
+  const logical = applyDecisionsDetailed(
+    raw,
+    state.decisions,
+    decisionIds(state.decisions),
+    truncateHeadChars,
+  ).messages;
+  const projection = projectMessages(logical);
+  return {
+    tokens: rawTokenEstimate(projection.messages, ctx),
+    messages: logical.length,
+  };
+}
+
 function failOpen(
   ctx: ExtensionContext,
   diagnostics: Diagnostics,
@@ -1215,12 +1278,27 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
     }
   });
   pi.on("session_before_compact", (event, ctx) => {
+    let sanitized: ApplyStats | undefined;
+    if (state.enabled && state.decisions.size > 0) {
+      sanitized = sanitizeCompactionPreparation(
+        event.preparation,
+        state.decisions,
+        config.truncateHeadChars,
+      );
+      diagnostics.record("native_compaction_sanitized", {
+        reason: event.reason,
+        committed: state.decisions.size,
+        ...sanitized,
+      });
+    }
+
     if (!state.enabled || event.reason !== "threshold") {
       diagnostics.record("before_compact", {
         reason: event.reason,
-        outcome: "pass",
+        outcome: state.enabled && sanitized ? "pass_sanitized" : "pass",
         enabled: state.enabled,
         willRetry: event.willRetry,
+        sanitized,
       });
       return;
     }
@@ -1229,29 +1307,43 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
     state.forceRefresh = true;
 
     const hasKey = Boolean(process.env.TYPESAFE_API_KEY?.trim());
-    const freshSuccess =
-      state.lastSuccessMs > 0 && Date.now() - state.lastSuccessMs <= config.successfulPassFreshMs;
+    const contextWindow = ctx.getContextUsage()?.contextWindow ?? ctx.model?.contextWindow;
+    const logical = logicalContextAtCompaction(
+      event.branchEntries,
+      ctx,
+      state,
+      config.truncateHeadChars,
+    );
+    const nativeLimit =
+      contextWindow && contextWindow > 0
+        ? Math.max(0, contextWindow - event.preparation.settings.reserveTokens)
+        : undefined;
+    const hasHeadroom = nativeLimit !== undefined && logical.tokens <= nativeLimit;
     const healthy =
       hasKey &&
       !breakerActive(state) &&
       !state.lastError &&
       !state.insufficient &&
-      freshSuccess &&
-      state.lastResult !== undefined &&
-      state.decisions.size > 0;
+      state.decisions.size > 0 &&
+      hasHeadroom;
 
     if (!healthy) {
       state.thresholdPassedCount += 1;
       diagnostics.record("before_compact", {
         reason: event.reason,
-        outcome: "pass_native",
+        outcome: "pass_native_sanitized",
         willRetry: event.willRetry,
         hasKey,
         breaker: breakerActive(state),
         lastError: state.lastError,
         insufficient: state.insufficient,
-        freshSuccess,
         committed: state.decisions.size,
+        logicalTokens: logical.tokens,
+        logicalMessages: logical.messages,
+        contextWindow,
+        nativeLimit,
+        hasHeadroom,
+        sanitized,
         thresholdPassedCount: state.thresholdPassedCount,
       });
       updateStatus(ctx, state);
@@ -1261,10 +1353,15 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
     state.thresholdCancelledCount += 1;
     diagnostics.record("before_compact", {
       reason: event.reason,
-      outcome: "cancel_for_jev",
+      outcome: "cancel_for_jev_headroom",
       willRetry: event.willRetry,
       committed: state.decisions.size,
-      lastSuccessAgeMs: Date.now() - state.lastSuccessMs,
+      logicalTokens: logical.tokens,
+      logicalMessages: logical.messages,
+      contextWindow,
+      nativeLimit,
+      hasHeadroom,
+      sanitized,
       thresholdCancelledCount: state.thresholdCancelledCount,
     });
     updateStatus(ctx, state);
@@ -1272,17 +1369,22 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
   });
 
   pi.on("session_compact", (event, ctx) => {
-    state.decisions.clear();
+    // Do not clear decisions yet: Pi keeps a raw recent tail after compaction.
+    // Decisions for calls still in that tail must continue to apply. The next
+    // context hook reconciles away decisions whose tool IDs were summarized.
     state.forceRefresh = false;
+    state.active = false;
     state.insufficient = false;
     state.lastError = undefined;
     state.lastResult = undefined;
+    state.lastSuccessMs = 0;
     state.restoredDecisionCount = 0;
-    persistLogicalState(pi, diagnostics, state, "native_compaction");
+    persistLogicalState(pi, diagnostics, state, "native_compaction_tail");
     diagnostics.record("session_compact", {
       reason: event.reason,
       willRetry: event.willRetry,
       fromExtension: event.fromExtension,
+      retainedDecisionsUntilReconcile: state.decisions.size,
     });
     updateStatus(ctx, state);
   });
