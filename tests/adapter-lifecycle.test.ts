@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
+import { stripTypeScriptTypes } from "node:module";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
@@ -47,4 +48,10 @@ test("agent_end promotes deferred full deletions only after clean stop", () => {
 test("defaults leave a gap between Jev and native fallback", () => {
   assert.match(source, /compactAtPercent:\s*80/);
   assert.match(source, /nativeFallbackPercent:\s*87\.5/);
+});
+
+test("Pi adapter TypeScript parses after type stripping", () => {
+  assert.doesNotThrow(() => {
+    stripTypeScriptTypes(source, { mode: "transform" });
+  });
 });
