@@ -60,6 +60,34 @@ test("drop_result uses an explicit pruned marker without retaining a source pref
   assert.doesNotMatch(source, /text\.slice\(0,\s*headChars\)/);
 });
 
+
+test("0.5 control keeps normal Jev scheduling on Pi/provider usage", () => {
+  const evaluateBlock = blockBetween(
+    "async function evaluateAtTurnEnd",
+    "export default function fastJevCompaction",
+  );
+  assert.match(evaluateBlock, /effectivePercent = usage\?\.percent \?\? logicalPercent/);
+  assert.doesNotMatch(evaluateBlock, /pressureSnapshot\s*\(/);
+  assert.doesNotMatch(evaluateBlock, /calibratedPressurePercent/);
+});
+
+test("0.5 control has no source-read pinning or recurring grounding machinery", () => {
+  assert.doesNotMatch(source, /latestReadEvidenceIds/);
+  assert.doesNotMatch(source, /readEvidenceKey/);
+  assert.doesNotMatch(source, /GROUNDING_REMINDER/);
+  assert.doesNotMatch(source, /fast-jev-grounding/);
+  assert.doesNotMatch(source, /protectedReadEvidence/);
+});
+
+test("native fallback still uses calibrated logical pressure safety check", () => {
+  const compactBlock = blockBetween(
+    "function logicalContextAtCompaction",
+    "function failOpen",
+  );
+  assert.match(compactBlock, /adjustedUsagePercent/);
+  assert.match(compactBlock, /Math\.max\(adjustedUsagePercent, estimatedPercent\)/);
+});
+
 test("Pi adapter TypeScript parses after type stripping", () => {
   assert.doesNotThrow(() => {
     stripTypeScriptTypes(source, { mode: "transform" });
