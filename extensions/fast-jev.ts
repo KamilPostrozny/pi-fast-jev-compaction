@@ -440,11 +440,33 @@ function formatTokens(value: number): string {
   return `${Math.round(value / 1000)}k`;
 }
 
+const GROUNDING_REMINDER =
+  "[fast-jev-compaction grounding] Some earlier tool outputs were pruned. Their contents are unavailable even if prior assistant reasoning describes them. Before an exact-match edit, patch, or replacement based on earlier file text, re-read the current target lines; do not reconstruct exact old text from memory.";
+
 function prunedResultText(text: string, isError: boolean): string {
   const marker =
-    `[fast-jev-compaction: result pruned${isError ? " (error)" : ""}; re-run this tool before relying on its output]`;
+    `[fast-jev-compaction: result pruned${isError ? " (error)" : ""}; contents unavailable even if earlier reasoning mentions them; re-run this tool before relying on its output or making an exact edit]`;
   // Do not make tiny results larger just to say they were pruned.
   return text.length <= marker.length ? text : marker;
+}
+
+function appendGroundingReminder(
+  messages: readonly AgentMessage[],
+  stats: ApplyStats,
+): AgentMessage[] {
+  if (stats.prunedResults === 0 && stats.droppedResults === 0 && stats.droppedCalls === 0) {
+    return [...messages];
+  }
+  return [
+    ...messages,
+    {
+      role: "custom",
+      customType: "fast-jev-grounding",
+      content: GROUNDING_REMINDER,
+      display: false,
+      timestamp: Date.now(),
+    } as AgentMessage,
+  ];
 }
 
 function applyDecisionsDetailed(
