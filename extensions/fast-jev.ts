@@ -17,6 +17,7 @@ import { Diagnostics, summarizeDiagnostic } from "./diagnostics.ts";
 import {
   acceptsReduction,
   activeRunAction,
+  canGuardNativeThreshold,
   requiredNewResultTokens,
   shouldDelayNativeThreshold,
   shouldEvaluateAtTurnEnd,
@@ -1362,7 +1363,7 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
   };
 
   diagnostics.record("extension_loaded", {
-    version: "0.6.3",
+    version: "0.6.4",
     compactAtPercent: config.compactAtPercent,
     nativeFallbackPercent: config.nativeFallbackPercent,
     reevaluateMidPercent: config.reevaluateMidPercent,
@@ -1499,11 +1500,15 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
   pi.on("session_before_compact", (event, ctx) => {
     try {
       const hasKey = Boolean(process.env.TYPESAFE_API_KEY?.trim());
-      const jevHealthy =
-        state.enabled &&
-        hasKey &&
+      const remoteHealthy =
         !breakerActive(state) &&
         !state.lastError;
+      const logicalGuardAvailable = canGuardNativeThreshold({
+        enabled: state.enabled,
+        hasKey,
+        remoteHealthy,
+        committedDecisions: state.decisions.size,
+      });
 
       const logical = logicalContextAtCompaction(
         ctx,
@@ -1515,7 +1520,7 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
         shouldDelayNativeThreshold(
           logical.percent,
           config.nativeFallbackPercent,
-          jevHealthy,
+          logicalGuardAvailable,
         )
       ) {
         state.thresholdCancelledCount += 1;
@@ -1531,6 +1536,11 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
           nativeFallbackPercent: config.nativeFallbackPercent,
           committed: state.decisions.size,
           deferredDropCalls: state.deferredDropCalls.size,
+          remoteHealthy,
+          logicalGuardAvailable,
+          retryRemainingMs: Math.max(0, state.retryAfterMs - Date.now()),
+          breakerRemainingMs: Math.max(0, state.breakerUntilMs - Date.now()),
+          lastError: state.lastError,
           thresholdCancelledCount: state.thresholdCancelledCount,
         });
         updateStatus(ctx, state);
@@ -1562,6 +1572,8 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
               : "pass_native",
         willRetry: event.willRetry,
         hasKey,
+        remoteHealthy,
+        logicalGuardAvailable,
         breaker: breakerActive(state),
         lastError: state.lastError,
         logicalTokens: logical.tokens,
