@@ -472,6 +472,56 @@ function decisionMap(result: CompactResult, calls: readonly JevToolCall[]): Map<
   return out;
 }
 
+function activeDecisionMaps(
+  result: CompactResult,
+  calls: readonly JevToolCall[],
+): {
+  committed: Map<string, CachedDecision>;
+  deferredDropCalls: Map<string, CachedDecision>;
+} {
+  const full = decisionMap(result, calls);
+  const committed = new Map<string, CachedDecision>();
+  const deferredDropCalls = new Map<string, CachedDecision>();
+  for (const [id, decision] of full) {
+    if (decision.action === "drop_call") deferredDropCalls.set(id, decision);
+    committed.set(id, { ...decision, action: activeRunAction(decision.action) });
+  }
+  return { committed, deferredDropCalls };
+}
+
+function projectedChars(messages: readonly JevMessage[]): number {
+  let total = 0;
+  for (const message of messages) {
+    total += message.text.length;
+    for (const tool of message.toolUses) {
+      try {
+        total += JSON.stringify(tool.input).length;
+      } catch {
+        total += 20;
+      }
+    }
+    for (const result of message.toolResults ?? []) total += result.text.length;
+  }
+  return total;
+}
+
+function activeReductionRatio(
+  messages: readonly AgentMessage[],
+  decisions: ReadonlyMap<string, CachedDecision>,
+  truncateHeadChars: number,
+): number {
+  const before = projectMessages(messages).messages;
+  const afterPi = applyDecisionsDetailed(
+    messages,
+    decisions,
+    decisionIds(decisions),
+    truncateHeadChars,
+  ).messages;
+  const after = projectMessages(afterPi).messages;
+  const charsBefore = projectedChars(before);
+  return charsBefore === 0 ? 0 : (charsBefore - projectedChars(after)) / charsBefore;
+}
+
 const ACTION_RANK: Record<CallAction, number> = { keep: 0, drop_result: 1, drop_call: 2 };
 
 /**
