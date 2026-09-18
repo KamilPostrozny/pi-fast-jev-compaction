@@ -45,36 +45,38 @@ test("agent_end promotes deferred full deletions only after clean stop", () => {
   assert.match(block, /deferredDropCalls\.clear\(\)/);
 });
 
-test("defaults use context-relative reevaluation gates", () => {
+test("defaults keep only trigger/fallback/min-reduction policy knobs", () => {
   assert.match(source, /compactAtPercent:\s*75/);
-  assert.match(source, /reevaluateMidPercent:\s*80/);
-  assert.match(source, /reevaluateUrgentPercent:\s*84/);
   assert.match(source, /nativeFallbackPercent:\s*87\.5/);
-  assert.match(source, /reevaluateLowResultPercent:\s*3/);
-  assert.match(source, /reevaluateMidResultPercent:\s*1\.5/);
-  assert.match(source, /reevaluateUrgentResultPercent:\s*0/);
-  assert.doesNotMatch(source, /PI_JEV_REEVALUATE_LOW_RESULT_TOKENS/);
-  assert.doesNotMatch(source, /PI_JEV_REEVALUATE_MID_RESULT_TOKENS/);
-  assert.doesNotMatch(source, /PI_JEV_REEVALUATE_URGENT_RESULT_TOKENS/);
+  assert.match(source, /minReductionRatio:\s*0\.01/);
+  assert.doesNotMatch(source, /REEVALUATE_MID_PERCENT/);
+  assert.doesNotMatch(source, /REEVALUATE_URGENT_PERCENT/);
+  assert.doesNotMatch(source, /REEVALUATE_.*RESULT_(TOKENS|PERCENT)/);
 });
 
 test("drop_result uses an explicit pruned marker without retaining a source prefix", () => {
   assert.match(source, /result pruned/);
-  assert.match(source, /contents unavailable even if earlier reasoning mentions them/);
+  assert.match(source, /re-run this tool before relying on its output/);
   assert.doesNotMatch(source, /truncateResultText/);
   assert.doesNotMatch(source, /PI_JEV_TRUNCATE_HEAD_CHARS/);
   assert.doesNotMatch(source, /text\.slice\(0,\s*headChars\)/);
 });
 
-test("context hook injects an ephemeral exact-edit grounding reminder after pruning", () => {
+test("context hook never injects a recurring grounding user message", () => {
   const block = blockBetween(
     'pi.on("context"',
     'pi.on("session_before_compact"',
   );
-  assert.match(block, /appendGroundingReminder\s*\(/);
-  assert.match(source, /do not reconstruct exact old text from memory/);
-  assert.match(source, /customType: "fast-jev-grounding"/);
-  assert.match(source, /display: false/);
+  assert.doesNotMatch(block, /fast-jev-grounding/);
+  assert.doesNotMatch(block, /appendGroundingReminder/);
+  assert.doesNotMatch(source, /GROUNDING_REMINDER/);
+});
+
+test("latest successful read evidence is protected from active Jev pruning", () => {
+  assert.match(source, /function latestReadEvidenceIds/);
+  assert.match(source, /block\.name !== "read"/);
+  assert.match(source, /sourceEvidenceIds = latestReadEvidenceIds\(logicalBefore\)/);
+  assert.match(source, /\.\.\.sourceEvidenceIds/);
 });
 
 test("turn-end scheduling and native fallback share calibrated pressure", () => {

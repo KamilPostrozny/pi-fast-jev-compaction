@@ -2,11 +2,8 @@ import type { CallAction } from "./fast-jev-core.ts";
 
 export interface TurnEndEvaluationPolicy {
   triggerPercent: number;
-  midPercent: number;
-  urgentPercent: number;
-  lowPressureResultPercent: number;
-  midPressureResultPercent: number;
-  urgentResultPercent: number;
+  fallbackPercent: number;
+  minReductionRatio: number;
 }
 
 export interface CalibratedPressureInput {
@@ -77,15 +74,17 @@ export function calibratedPressurePercent(input: CalibratedPressureInput): numbe
   return Math.max(estimatedPercent, providerAdjustedPercent);
 }
 
-function resultPercentForPressure(
-  pressurePercent: number,
-  policy: TurnEndEvaluationPolicy,
-): number {
-  if (pressurePercent >= policy.urgentPercent) return policy.urgentResultPercent;
-  if (pressurePercent >= policy.midPercent) return policy.midPressureResultPercent;
-  return policy.lowPressureResultPercent;
-}
-
+/**
+ * Re-evaluation volume is derived from two existing policy quantities instead
+ * of fixed token counts or extra pressure bands:
+ *
+ * 1. the minimum reduction we consider useful; and
+ * 2. the remaining headroom before Pi's native fallback.
+ *
+ * Far from native fallback, wait until new eligible results could account for
+ * at least one minimum-useful reduction. As fallback approaches, the remaining
+ * headroom becomes the smaller value, so the gate tightens continuously.
+ */
 export function requiredNewResultTokens(
   pressurePercent: number | null,
   contextWindow: number | null | undefined,
@@ -102,16 +101,25 @@ export function requiredNewResultTokens(
     return null;
   }
 
-  const fraction = Math.max(0, resultPercentForPressure(pressurePercent, policy)) / 100;
-  // "0%" means any non-empty new eligible result is enough.
-  return Math.max(1, Math.ceil(contextWindow * fraction));
+  const minimumUsefulTokens = Math.max(
+    1,
+    Math.ceil(contextWindow * Math.max(0, policy.minReductionRatio)),
+  );
+  const remainingHeadroomTokens = Math.max(
+    0,
+    Math.ceil(
+      contextWindow *
+        Math.max(0, policy.fallbackPercent - pressurePercent) /
+        100,
+    ),
+  );
+
+  return Math.max(1, Math.min(minimumUsefulTokens, remainingHeadroomTokens));
 }
 
 /**
  * The first pass runs as soon as the trigger is crossed. Later passes are
- * driven by NEW eligible tool-result volume. The volume gates are percentages
- * of the current model's context window, so a 32k, 64k, or 128k model gets the
- * same policy rather than the same absolute token count.
+ * driven by NEW eligible tool-result volume using requiredNewResultTokens().
  */
 export function shouldEvaluateAtTurnEnd(args: {
   pressurePercent: number | null;
@@ -140,9 +148,7 @@ export function shouldEvaluateAtTurnEnd(args: {
   const required = requiredNewResultTokens(pressurePercent, contextWindow, policy);
   if (required === null) return false;
 
-  // First pressure-triggered evaluation in this logical-history segment.
   if (previouslyEvaluatedCalls <= 0) return true;
-
   if (newEligibleCalls <= 0) return false;
   return newEligibleResultTokens >= required;
 }
