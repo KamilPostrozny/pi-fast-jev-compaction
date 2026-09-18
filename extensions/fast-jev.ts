@@ -1464,7 +1464,7 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
         state.decisions,
         decisionIds(state.decisions),
       );
-      const logicalMessages = applied.messages;
+      const logicalMessages = appendGroundingReminder(applied.messages, applied.stats);
       const grossProjection = projectMessages(event.messages);
       const logicalProjection = projectMessages(logicalMessages);
       const logicalCalls = collectToolCalls(
@@ -1475,26 +1475,25 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
 
       const grossTokens = rawTokenEstimate(grossProjection.messages, ctx);
       const logicalTokens = rawTokenEstimate(logicalProjection.messages, ctx);
-      const usage = ctx.getContextUsage();
-      const contextWindow = usage?.contextWindow ?? ctx.model?.contextWindow;
+      const pressure = pressureSnapshot(logicalTokens, ctx, state);
+      const contextWindow = pressure.contextWindow;
       const grossPercent =
         contextWindow && contextWindow > 0 ? (grossTokens / contextWindow) * 100 : undefined;
-      const logicalPercent =
-        contextWindow && contextWindow > 0 ? (logicalTokens / contextWindow) * 100 : undefined;
-      const effectivePercent = usage?.percent ?? logicalPercent ?? null;
+      const pressurePercent = pressure.pressurePercent;
 
       state.lastRawTokens = grossTokens;
       state.lastRawPercent = grossPercent;
       state.lastLogicalTokens = logicalTokens;
-      state.lastLogicalPercent = logicalPercent;
-      state.lastPiTokens = usage?.tokens ?? undefined;
-      state.lastPiPercent = effectivePercent ?? undefined;
+      state.lastLogicalPercent = pressure.logicalPercent;
+      state.lastPressurePercent = pressurePercent ?? undefined;
+      state.lastPiTokens = pressure.providerTokens;
+      state.lastPiPercent = pressure.providerPercent;
       state.lastContextWindow = contextWindow;
       state.lastGrossToolCalls = rawIds.size;
       state.lastLogicalToolCalls = logicalCalls.length;
       state.lastApply = applied.stats;
       state.active =
-        effectivePercent !== null && effectivePercent >= config.compactAtPercent;
+        pressurePercent !== null && pressurePercent >= config.compactAtPercent;
 
       state.lastContextOutcome =
         state.decisions.size > 0
@@ -1518,9 +1517,16 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
         logicalTokens,
         contextWindow,
         grossPercent: grossPercent === undefined ? null : Number(grossPercent.toFixed(2)),
-        logicalPercent: logicalPercent === undefined ? null : Number(logicalPercent.toFixed(2)),
-        piTokens: usage?.tokens ?? null,
-        piPercent: effectivePercent === null ? null : Number(effectivePercent.toFixed(2)),
+        logicalPercent:
+          pressure.logicalPercent === undefined ? null : Number(pressure.logicalPercent.toFixed(2)),
+        pressurePercent: pressurePercent === null ? null : Number(pressurePercent.toFixed(2)),
+        piTokens: pressure.providerTokens ?? null,
+        piPercent:
+          pressure.providerPercent === undefined ? null : Number(pressure.providerPercent.toFixed(2)),
+        groundingReminder:
+          applied.stats.prunedResults > 0 ||
+          applied.stats.droppedResults > 0 ||
+          applied.stats.droppedCalls > 0,
         compactAtPercent: config.compactAtPercent,
         ...applied.stats,
         durationMs: Date.now() - hookStarted,
