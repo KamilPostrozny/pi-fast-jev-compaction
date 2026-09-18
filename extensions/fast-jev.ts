@@ -17,6 +17,7 @@ import { Diagnostics, summarizeDiagnostic } from "./diagnostics.ts";
 import {
   acceptsReduction,
   activeRunAction,
+  calibratedPressurePercent,
   requiredNewResultTokens,
   shouldDelayNativeThreshold,
   shouldEvaluateAtTurnEnd,
@@ -32,9 +33,9 @@ export interface Config {
   nativeFallbackPercent: number;
   reevaluateMidPercent: number;
   reevaluateUrgentPercent: number;
-  reevaluateLowResultTokens: number;
-  reevaluateMidResultTokens: number;
-  reevaluateUrgentResultTokens: number;
+  reevaluateLowResultPercent: number;
+  reevaluateMidResultPercent: number;
+  reevaluateUrgentResultPercent: number;
   minReductionRatio: number;
   keepThreshold: number;
   preserveRecentMessages: number;
@@ -58,9 +59,9 @@ const DEFAULTS: Config = {
   nativeFallbackPercent: 87.5,
   reevaluateMidPercent: 80,
   reevaluateUrgentPercent: 84,
-  reevaluateLowResultTokens: 2_000,
-  reevaluateMidResultTokens: 1_000,
-  reevaluateUrgentResultTokens: 1,
+  reevaluateLowResultPercent: 3,
+  reevaluateMidResultPercent: 1.5,
+  reevaluateUrgentResultPercent: 0,
   minReductionRatio: 0.01,
   keepThreshold: 0.5,
   preserveRecentMessages: 6,
@@ -138,6 +139,7 @@ interface RuntimeState {
   lastPiPercent?: number;
   lastLogicalTokens?: number;
   lastLogicalPercent?: number;
+  lastPressurePercent?: number;
   lastGrossToolCalls?: number;
   lastLogicalToolCalls?: number;
   restoredDecisionCount: number;
@@ -222,17 +224,17 @@ export function resolveConfig(): Config {
     ),
     reevaluateMidPercent,
     reevaluateUrgentPercent,
-    reevaluateLowResultTokens: Math.max(
-      1,
-      Math.floor(envNumber("PI_JEV_REEVALUATE_LOW_RESULT_TOKENS", DEFAULTS.reevaluateLowResultTokens)),
+    reevaluateLowResultPercent: Math.max(
+      0,
+      envNumber("PI_JEV_REEVALUATE_LOW_RESULT_PERCENT", DEFAULTS.reevaluateLowResultPercent),
     ),
-    reevaluateMidResultTokens: Math.max(
-      1,
-      Math.floor(envNumber("PI_JEV_REEVALUATE_MID_RESULT_TOKENS", DEFAULTS.reevaluateMidResultTokens)),
+    reevaluateMidResultPercent: Math.max(
+      0,
+      envNumber("PI_JEV_REEVALUATE_MID_RESULT_PERCENT", DEFAULTS.reevaluateMidResultPercent),
     ),
-    reevaluateUrgentResultTokens: Math.max(
-      1,
-      Math.floor(envNumber("PI_JEV_REEVALUATE_URGENT_RESULT_TOKENS", DEFAULTS.reevaluateUrgentResultTokens)),
+    reevaluateUrgentResultPercent: Math.max(
+      0,
+      envNumber("PI_JEV_REEVALUATE_URGENT_RESULT_PERCENT", DEFAULTS.reevaluateUrgentResultPercent),
     ),
     minReductionRatio: envNumber("PI_JEV_MIN_REDUCTION_RATIO", DEFAULTS.minReductionRatio),
     keepThreshold: envNumber("PI_JEV_KEEP_THRESHOLD", DEFAULTS.keepThreshold),
@@ -395,6 +397,39 @@ function rawTokenEstimate(projected: readonly JevMessage[], ctx: ExtensionContex
   return conversation + system;
 }
 
+interface PressureSnapshot {
+  contextWindow?: number;
+  providerTokens?: number;
+  providerPercent?: number;
+  logicalPercent?: number;
+  pressurePercent: number | null;
+}
+
+function pressureSnapshot(
+  logicalTokens: number,
+  ctx: ExtensionContext,
+  state: RuntimeState,
+): PressureSnapshot {
+  const usage = ctx.getContextUsage();
+  const contextWindow = usage?.contextWindow ?? ctx.model?.contextWindow;
+  const logicalPercent =
+    contextWindow && contextWindow > 0 ? (logicalTokens / contextWindow) * 100 : undefined;
+  const pressurePercent = calibratedPressurePercent({
+    logicalTokens,
+    contextWindow,
+    providerTokens: usage?.tokens,
+    providerPercent: usage?.percent,
+    pendingReductionTokens: state.pendingReductionTokens,
+  });
+  return {
+    contextWindow,
+    providerTokens: usage?.tokens ?? undefined,
+    providerPercent: usage?.percent ?? undefined,
+    logicalPercent,
+    pressurePercent,
+  };
+}
+
 function percent(value: number): string {
   return `${Math.round(value * 100)}%`;
 }
@@ -405,11 +440,33 @@ function formatTokens(value: number): string {
   return `${Math.round(value / 1000)}k`;
 }
 
+const GROUNDING_REMINDER =
+  "[fast-jev-compaction grounding] Some earlier tool outputs were pruned. Their contents are unavailable even if prior assistant reasoning describes them. Before an exact-match edit, patch, or replacement based on earlier file text, re-read the current target lines; do not reconstruct exact old text from memory.";
+
 function prunedResultText(text: string, isError: boolean): string {
   const marker =
-    `[fast-jev-compaction: result pruned${isError ? " (error)" : ""}; re-run this tool before relying on its output]`;
+    `[fast-jev-compaction: result pruned${isError ? " (error)" : ""}; contents unavailable even if earlier reasoning mentions them; re-run this tool before relying on its output or making an exact edit]`;
   // Do not make tiny results larger just to say they were pruned.
   return text.length <= marker.length ? text : marker;
+}
+
+function appendGroundingReminder(
+  messages: readonly AgentMessage[],
+  stats: ApplyStats,
+): AgentMessage[] {
+  if (stats.prunedResults === 0 && stats.droppedResults === 0 && stats.droppedCalls === 0) {
+    return [...messages];
+  }
+  return [
+    ...messages,
+    {
+      role: "custom",
+      customType: "fast-jev-grounding",
+      content: GROUNDING_REMINDER,
+      display: false,
+      timestamp: Date.now(),
+    } as AgentMessage,
+  ];
 }
 
 function applyDecisionsDetailed(
@@ -686,9 +743,9 @@ function evaluationPolicy(config: Config): TurnEndEvaluationPolicy {
     triggerPercent: config.compactAtPercent,
     midPercent: config.reevaluateMidPercent,
     urgentPercent: config.reevaluateUrgentPercent,
-    lowPressureResultTokens: config.reevaluateLowResultTokens,
-    midPressureResultTokens: config.reevaluateMidResultTokens,
-    urgentResultTokens: config.reevaluateUrgentResultTokens,
+    lowPressureResultPercent: config.reevaluateLowResultPercent,
+    midPressureResultPercent: config.reevaluateMidResultPercent,
+    urgentResultPercent: config.reevaluateUrgentResultPercent,
   };
 }
 
@@ -1014,36 +1071,18 @@ function logicalContextAtCompaction(
   state: RuntimeState,
 ): { tokens: number; messages: number; percent: number | null } {
   const raw = ctx.sessionManager.buildSessionContext().messages;
-  const logical = applyDecisionsDetailed(
+  const applied = applyDecisionsDetailed(
     raw,
     state.decisions,
     decisionIds(state.decisions),
-  ).messages;
+  );
+  const logical = appendGroundingReminder(applied.messages, applied.stats);
   const projection = projectMessages(logical);
   const tokens = rawTokenEstimate(projection.messages, ctx);
-  const usage = ctx.getContextUsage();
-  const contextWindow = usage?.contextWindow ?? ctx.model?.contextWindow;
-  const estimatedPercent =
-    contextWindow && contextWindow > 0 ? (tokens / contextWindow) * 100 : null;
-  const adjustedUsagePercent =
-    usage?.tokens !== null &&
-    usage?.tokens !== undefined &&
-    contextWindow &&
-    contextWindow > 0
-      ? (Math.max(0, usage.tokens - state.pendingReductionTokens) / contextWindow) * 100
-      : usage?.percent ?? null;
-  // Calibrate the local estimate against Pi's provider-backed usage while
-  // subtracting only pruning committed after that usage measurement.
-  const percent =
-    adjustedUsagePercent === null || adjustedUsagePercent === undefined
-      ? estimatedPercent
-      : estimatedPercent === null
-        ? adjustedUsagePercent
-        : Math.max(adjustedUsagePercent, estimatedPercent);
   return {
     tokens,
     messages: logical.length,
-    percent,
+    percent: pressureSnapshot(tokens, ctx, state).pressurePercent,
   };
 }
 
@@ -1096,11 +1135,13 @@ async function evaluateAtTurnEnd(
     if (!rawIds.has(id)) state.lastEvaluatedEligibleIds.delete(id);
   }
 
-  const logicalBefore = applyDecisionsDetailed(
+  const appliedBefore = applyDecisionsDetailed(
     rawMessages,
     state.decisions,
     decisionIds(state.decisions),
-  ).messages;
+  );
+  const logicalBefore = appliedBefore.messages;
+  const modelFacingBefore = appendGroundingReminder(logicalBefore, appliedBefore.stats);
   const projection = projectMessages(logicalBefore);
   const calls = collectToolCalls(
     projection.messages,
@@ -1114,28 +1155,34 @@ async function evaluateAtTurnEnd(
   const newEligibleIds = newEligibleToolIds(eligibleNow, state.lastEvaluatedEligibleIds);
   const newEligibleResultTokens = toolResultTokenVolume(projection.messages, newEligibleIds);
 
-  const usage = ctx.getContextUsage();
-  const contextWindow = usage?.contextWindow ?? ctx.model?.contextWindow;
-  const logicalTokens = rawTokenEstimate(projection.messages, ctx);
-  const logicalPercent =
-    contextWindow && contextWindow > 0 ? (logicalTokens / contextWindow) * 100 : null;
-  const effectivePercent = usage?.percent ?? logicalPercent;
+  const modelFacingProjection = projectMessages(modelFacingBefore);
+  const logicalTokens = rawTokenEstimate(modelFacingProjection.messages, ctx);
+  const pressure = pressureSnapshot(logicalTokens, ctx, state);
+  const contextWindow = pressure.contextWindow;
+  const logicalPercent = pressure.logicalPercent ?? null;
+  const pressurePercent = pressure.pressurePercent;
   const policy = evaluationPolicy(config);
-  const requiredResultTokens = requiredNewResultTokens(effectivePercent, policy);
+  const requiredResultTokens = requiredNewResultTokens(
+    pressurePercent,
+    contextWindow,
+    policy,
+  );
 
-  state.lastPiTokens = usage?.tokens ?? undefined;
-  state.lastPiPercent = effectivePercent ?? undefined;
+  state.lastPiTokens = pressure.providerTokens;
+  state.lastPiPercent = pressure.providerPercent;
   state.lastContextWindow = contextWindow;
   state.lastLogicalTokens = logicalTokens;
-  state.lastLogicalPercent = logicalPercent ?? undefined;
+  state.lastLogicalPercent = pressure.logicalPercent;
+  state.lastPressurePercent = pressurePercent ?? undefined;
   state.lastLogicalToolCalls = calls.length;
   state.lastNewEligibleResultTokens = newEligibleResultTokens;
   state.lastRequiredNewResultTokens = requiredResultTokens;
-  state.active = effectivePercent !== null && effectivePercent >= config.compactAtPercent;
+  state.active = pressurePercent !== null && pressurePercent >= config.compactAtPercent;
 
   const forceRefresh = state.forceRefresh;
   const shouldEvaluate = shouldEvaluateAtTurnEnd({
-    effectivePercent,
+    pressurePercent,
+    contextWindow,
     forceRefresh,
     eligibleCalls: eligibleNow.size,
     previouslyEvaluatedCalls: previouslyEvaluatedNow.size,
@@ -1146,7 +1193,9 @@ async function evaluateAtTurnEnd(
 
   diagnostics.record("turn_evaluation_check", {
     turnIndex,
-    effectivePercent: effectivePercent === null ? null : Number(effectivePercent.toFixed(2)),
+    pressurePercent: pressurePercent === null ? null : Number(pressurePercent.toFixed(2)),
+    piPercent:
+      pressure.providerPercent === undefined ? null : Number(pressure.providerPercent.toFixed(2)),
     logicalPercent: logicalPercent === null ? null : Number(logicalPercent.toFixed(2)),
     triggerPercent: config.compactAtPercent,
     midPercent: config.reevaluateMidPercent,
@@ -1209,7 +1258,7 @@ async function evaluateAtTurnEnd(
     state,
     eligibleNow.size,
     logicalTokens,
-    effectivePercent,
+    pressurePercent,
     forceRefresh ? ["forced"] : ["turn_end_threshold"],
   );
   diagnostics.record("evaluation_start", {
@@ -1219,7 +1268,9 @@ async function evaluateAtTurnEnd(
     logicalCalls: calls.length,
     committedBefore: state.decisions.size,
     logicalTokens,
-    effectivePercent: effectivePercent === null ? null : Number(effectivePercent.toFixed(2)),
+    pressurePercent: pressurePercent === null ? null : Number(pressurePercent.toFixed(2)),
+    piPercent:
+      pressure.providerPercent === undefined ? null : Number(pressure.providerPercent.toFixed(2)),
     newEligibleCalls: newEligibleIds.size,
     newEligibleResultTokens,
     requiredNewResultTokens: requiredResultTokens,
@@ -1362,14 +1413,14 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
   };
 
   diagnostics.record("extension_loaded", {
-    version: "0.5.0",
+    version: "0.6.0",
     compactAtPercent: config.compactAtPercent,
     nativeFallbackPercent: config.nativeFallbackPercent,
     reevaluateMidPercent: config.reevaluateMidPercent,
     reevaluateUrgentPercent: config.reevaluateUrgentPercent,
-    reevaluateLowResultTokens: config.reevaluateLowResultTokens,
-    reevaluateMidResultTokens: config.reevaluateMidResultTokens,
-    reevaluateUrgentResultTokens: config.reevaluateUrgentResultTokens,
+    reevaluateLowResultPercent: config.reevaluateLowResultPercent,
+    reevaluateMidResultPercent: config.reevaluateMidResultPercent,
+    reevaluateUrgentResultPercent: config.reevaluateUrgentResultPercent,
     minReductionRatio: config.minReductionRatio,
     requestTimeoutMs: config.requestTimeoutMs,
     evaluationTimeoutMs: config.evaluationTimeoutMs,
@@ -1417,7 +1468,7 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
         state.decisions,
         decisionIds(state.decisions),
       );
-      const logicalMessages = applied.messages;
+      const logicalMessages = appendGroundingReminder(applied.messages, applied.stats);
       const grossProjection = projectMessages(event.messages);
       const logicalProjection = projectMessages(logicalMessages);
       const logicalCalls = collectToolCalls(
@@ -1428,26 +1479,25 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
 
       const grossTokens = rawTokenEstimate(grossProjection.messages, ctx);
       const logicalTokens = rawTokenEstimate(logicalProjection.messages, ctx);
-      const usage = ctx.getContextUsage();
-      const contextWindow = usage?.contextWindow ?? ctx.model?.contextWindow;
+      const pressure = pressureSnapshot(logicalTokens, ctx, state);
+      const contextWindow = pressure.contextWindow;
       const grossPercent =
         contextWindow && contextWindow > 0 ? (grossTokens / contextWindow) * 100 : undefined;
-      const logicalPercent =
-        contextWindow && contextWindow > 0 ? (logicalTokens / contextWindow) * 100 : undefined;
-      const effectivePercent = usage?.percent ?? logicalPercent ?? null;
+      const pressurePercent = pressure.pressurePercent;
 
       state.lastRawTokens = grossTokens;
       state.lastRawPercent = grossPercent;
       state.lastLogicalTokens = logicalTokens;
-      state.lastLogicalPercent = logicalPercent;
-      state.lastPiTokens = usage?.tokens ?? undefined;
-      state.lastPiPercent = effectivePercent ?? undefined;
+      state.lastLogicalPercent = pressure.logicalPercent;
+      state.lastPressurePercent = pressurePercent ?? undefined;
+      state.lastPiTokens = pressure.providerTokens;
+      state.lastPiPercent = pressure.providerPercent;
       state.lastContextWindow = contextWindow;
       state.lastGrossToolCalls = rawIds.size;
       state.lastLogicalToolCalls = logicalCalls.length;
       state.lastApply = applied.stats;
       state.active =
-        effectivePercent !== null && effectivePercent >= config.compactAtPercent;
+        pressurePercent !== null && pressurePercent >= config.compactAtPercent;
 
       state.lastContextOutcome =
         state.decisions.size > 0
@@ -1471,9 +1521,16 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
         logicalTokens,
         contextWindow,
         grossPercent: grossPercent === undefined ? null : Number(grossPercent.toFixed(2)),
-        logicalPercent: logicalPercent === undefined ? null : Number(logicalPercent.toFixed(2)),
-        piTokens: usage?.tokens ?? null,
-        piPercent: effectivePercent === null ? null : Number(effectivePercent.toFixed(2)),
+        logicalPercent:
+          pressure.logicalPercent === undefined ? null : Number(pressure.logicalPercent.toFixed(2)),
+        pressurePercent: pressurePercent === null ? null : Number(pressurePercent.toFixed(2)),
+        piTokens: pressure.providerTokens ?? null,
+        piPercent:
+          pressure.providerPercent === undefined ? null : Number(pressure.providerPercent.toFixed(2)),
+        groundingReminder:
+          applied.stats.prunedResults > 0 ||
+          applied.stats.droppedResults > 0 ||
+          applied.stats.droppedCalls > 0,
         compactAtPercent: config.compactAtPercent,
         ...applied.stats,
         durationMs: Date.now() - hookStarted,
@@ -1659,12 +1716,12 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
       : `unknown${rawWindow}`;
     const lines = [
       `fast-jev-compaction: enabled=${state.enabled} · at-threshold=${state.active} · evaluating=${state.evaluating}`,
-      `context: Pi≈${piContext} · Jev trigger=${config.compactAtPercent}% · adaptive=${config.reevaluateMidPercent}%/${config.reevaluateUrgentPercent}% · native fallback=${config.nativeFallbackPercent}%`,
+      `context: Pi≈${piContext} · calibrated pressure=${state.lastPressurePercent === undefined ? "unknown" : `${state.lastPressurePercent.toFixed(1)}%`} · Jev trigger=${config.compactAtPercent}% · adaptive=${config.reevaluateMidPercent}%/${config.reevaluateUrgentPercent}% · native fallback=${config.nativeFallbackPercent}%`,
       `logical history≈${logicalContext} · calls=${state.lastLogicalToolCalls ?? "n/a"}; this is what the model and next Jev pass see`,
       `persisted Pi transcript≈${formatTokens(state.lastRawTokens ?? 0)}${rawWindow} (${(state.lastRawPercent ?? 0).toFixed(1)}%) · calls=${state.lastGrossToolCalls ?? "n/a"}; diagnostic only`,
       `committed decisions: ${state.decisions.size} total · drop_call=${committedDropCalls} · drop_result=${committedDropResults} · keep=${committedKeeps} · deferred drop_call=${state.deferredDropCalls.size} · restored=${state.restoredDecisionCount}`,
       `evaluations: ${state.evaluationSuccesses}/${state.evaluationAttempts} successful · Jev HTTP requests=${state.totalHttpRequests} total${state.lastEvaluationRequests !== undefined ? ` (last pass=${state.lastEvaluationRequests})` : ""}`,
-      `reevaluation: new result≈${formatTokens(state.lastNewEligibleResultTokens ?? 0)} tokens · required=${state.lastRequiredNewResultTokens === null || state.lastRequiredNewResultTokens === undefined ? "n/a" : formatTokens(state.lastRequiredNewResultTokens)} · baseline calls=${state.lastEvaluatedEligibleIds.size}`,
+      `reevaluation: new result≈${formatTokens(state.lastNewEligibleResultTokens ?? 0)} tokens · required=${state.lastRequiredNewResultTokens === null || state.lastRequiredNewResultTokens === undefined ? "n/a" : formatTokens(state.lastRequiredNewResultTokens)} · gates=${config.reevaluateLowResultPercent}%/${config.reevaluateMidResultPercent}%/${config.reevaluateUrgentResultPercent}% of window · baseline calls=${state.lastEvaluatedEligibleIds.size}`,
       result
         ? `last pass: mode=${state.lastEvaluationMode ?? "n/a"} · effective reduction=${state.lastEffectiveReduction === undefined ? "n/a" : percent(state.lastEffectiveReduction)} · upstream=${percent(reductionRatio(result))} · eligible=${state.lastEvaluationEligible ?? "n/a"} · ${state.lastEvaluationMs ?? "n/a"}ms · Jev state≈${formatTokens(result.stats.stateTokens)} (${result.stats.stateStage || "n/a"})`
         : "last pass: n/a",

@@ -45,19 +45,49 @@ test("agent_end promotes deferred full deletions only after clean stop", () => {
   assert.match(block, /deferredDropCalls\.clear\(\)/);
 });
 
-test("defaults leave a wider gap between Jev and native fallback", () => {
+test("defaults use context-relative reevaluation gates", () => {
   assert.match(source, /compactAtPercent:\s*75/);
   assert.match(source, /reevaluateMidPercent:\s*80/);
   assert.match(source, /reevaluateUrgentPercent:\s*84/);
   assert.match(source, /nativeFallbackPercent:\s*87\.5/);
-  assert.match(source, /minReductionRatio:\s*0\.01/);
+  assert.match(source, /reevaluateLowResultPercent:\s*3/);
+  assert.match(source, /reevaluateMidResultPercent:\s*1\.5/);
+  assert.match(source, /reevaluateUrgentResultPercent:\s*0/);
+  assert.doesNotMatch(source, /PI_JEV_REEVALUATE_LOW_RESULT_TOKENS/);
+  assert.doesNotMatch(source, /PI_JEV_REEVALUATE_MID_RESULT_TOKENS/);
+  assert.doesNotMatch(source, /PI_JEV_REEVALUATE_URGENT_RESULT_TOKENS/);
 });
 
 test("drop_result uses an explicit pruned marker without retaining a source prefix", () => {
   assert.match(source, /result pruned/);
+  assert.match(source, /contents unavailable even if earlier reasoning mentions them/);
   assert.doesNotMatch(source, /truncateResultText/);
   assert.doesNotMatch(source, /PI_JEV_TRUNCATE_HEAD_CHARS/);
   assert.doesNotMatch(source, /text\.slice\(0,\s*headChars\)/);
+});
+
+test("context hook injects an ephemeral exact-edit grounding reminder after pruning", () => {
+  const block = blockBetween(
+    'pi.on("context"',
+    'pi.on("session_before_compact"',
+  );
+  assert.match(block, /appendGroundingReminder\s*\(/);
+  assert.match(source, /do not reconstruct exact old text from memory/);
+  assert.match(source, /customType: "fast-jev-grounding"/);
+  assert.match(source, /display: false/);
+});
+
+test("turn-end scheduling and native fallback share calibrated pressure", () => {
+  const evaluateBlock = blockBetween(
+    "async function evaluateAtTurnEnd",
+    "export default function fastJevCompaction",
+  );
+  const compactBlock = blockBetween(
+    "function logicalContextAtCompaction",
+    "function failOpen",
+  );
+  assert.match(evaluateBlock, /pressureSnapshot\s*\(/);
+  assert.match(compactBlock, /pressureSnapshot\s*\(/);
 });
 
 test("Pi adapter TypeScript parses after type stripping", () => {

@@ -4,13 +4,38 @@ A Pi package port of [`tamaratran/fast-jev-compaction`](https://github.com/tamar
 
 It uses TypeSafe Jev to decide, tool call by tool call, which old calls/results still need to remain in model context. User and assistant prose is not summarized or rewritten by this extension. Pi's persisted session transcript stays intact.
 
+## 0.6.0: calibrated pressure and grounding safeguards
+
+0.6.0 addresses two failure modes observed in long coding runs.
+
+- Jev scheduling and Pi native-fallback decisions now use the **same calibrated pressure signal**: the larger of the model-facing logical-context estimate and Pi's provider-backed usage after subtracting only fresh Jev reductions that Pi has not measured yet.
+- This prevents the previous disagreement where Jev saw ~80% while the native hook saw ~89% and allowed native compaction before Jev got another urgent pass.
+- Re-evaluation volume gates are now **percentages of the active model's context window**, not fixed token counts:
+  - 75–80% pressure: new eligible results must total about **3% of the context window**.
+  - 80–84% pressure: about **1.5% of the context window**.
+  - >=84% pressure: any non-empty new eligible result can trigger another pass.
+- The same policy therefore scales naturally across 32k, 64k, 128k, and other context sizes.
+- Whenever Jev has pruned or removed tool evidence, the model receives a short **ephemeral grounding instruction** on each provider request. It explicitly says that pruned output is unavailable even if earlier assistant reasoning describes it, and requires a fresh read/grep before exact-match edits or patches.
+- The grounding instruction is produced by the `context` hook only. It is never persisted into the Pi transcript or shown as a user-authored message.
+- Result-pruned markers were strengthened with the same warning so buried historical context and the latest grounding reminder agree.
+
+The default pressure bands remain:
+
+```text
+<75%        normal work
+75–80%      Jev; re-evaluate after ~3% of window in new eligible results
+80–84%      Jev; re-evaluate after ~1.5% of window in new eligible results
+84–87.5%    Jev whenever any new eligible result is available
+>=87.5%     Pi native compaction fallback if calibrated logical pressure is still high
+```
+
 ## 0.5.0: adaptive result pruning
 
 0.5.0 tunes the turn-end strategy for long autonomous coding runs on small local context windows.
 
 - The default Jev trigger moves from **80% to 75%**.
 - The minimum accepted effective reduction drops from **25% to 1%**. Once Jev has safely identified removable result content, even a small useful reduction is committed instead of discarded.
-- Active-run `drop_result` no longer preserves an arbitrary prefix of the old output. The tool call stays visible, while the result becomes an explicit marker telling the model to re-run the tool before relying on its output.
+- Active-run `drop_result` no longer preserves an arbitrary prefix of the old output. The tool call stays visible, while the result becomes an explicit marker telling the model to re-run the tool before relying on its output. In 0.6.0 the marker also warns that earlier assistant reasoning is not ground truth for exact edits.
 - Re-evaluation is driven by **new eligible tool-result tokens since the last successful Jev evaluation**, not merely by another tool call appearing:
   - 75–80%: require about **2,000** new result tokens.
   - 80–84%: require about **1,000** new result tokens.
@@ -128,6 +153,9 @@ export TYPESAFE_API_KEY="..."
 export PI_JEV_COMPACT_AT_PERCENT=75
 export PI_JEV_REEVALUATE_MID_PERCENT=80
 export PI_JEV_REEVALUATE_URGENT_PERCENT=84
+export PI_JEV_REEVALUATE_LOW_RESULT_PERCENT=3
+export PI_JEV_REEVALUATE_MID_RESULT_PERCENT=1.5
+export PI_JEV_REEVALUATE_URGENT_RESULT_PERCENT=0
 export PI_JEV_NATIVE_FALLBACK_PERCENT=87.5
 export PI_JEV_REQUEST_TIMEOUT_MS=8000
 export PI_JEV_EVALUATION_TIMEOUT_MS=12000
@@ -141,9 +169,9 @@ export PI_JEV_DIAGNOSTICS=1
 | `PI_JEV_COMPACT_AT_PERCENT` | `75` | Run the first pressure-triggered Jev evaluation at `turn_end` once effective context reaches this percentage |
 | `PI_JEV_REEVALUATE_MID_PERCENT` | `80` | At or above this pressure, lower the new-result threshold for another Jev pass |
 | `PI_JEV_REEVALUATE_URGENT_PERCENT` | `84` | At or above this pressure, re-evaluate whenever meaningful new eligible result output appears |
-| `PI_JEV_REEVALUATE_LOW_RESULT_TOKENS` | `2000` | New eligible tool-result tokens required for another pass between the trigger and mid-pressure thresholds |
-| `PI_JEV_REEVALUATE_MID_RESULT_TOKENS` | `1000` | New eligible tool-result tokens required between the mid and urgent thresholds |
-| `PI_JEV_REEVALUATE_URGENT_RESULT_TOKENS` | `1` | New eligible result tokens required at urgent pressure |
+| `PI_JEV_REEVALUATE_LOW_RESULT_PERCENT` | `3` | New eligible tool-result volume required between trigger and mid pressure, as a percentage of the active model's context window |
+| `PI_JEV_REEVALUATE_MID_RESULT_PERCENT` | `1.5` | New eligible tool-result volume required between mid and urgent pressure, as a percentage of the context window |
+| `PI_JEV_REEVALUATE_URGENT_RESULT_PERCENT` | `0` | At urgent pressure, 0% means any non-empty new eligible result can trigger another pass |
 | `PI_JEV_NATIVE_FALLBACK_PERCENT` | `87.5` | Delay Pi threshold compaction to this logical-context percentage while Jev is healthy; overflow recovery is unaffected |
 | `PI_JEV_MIN_REDUCTION_RATIO` | `0.01` | Minimum effective reduction required to commit a pass; 1% avoids accepting effectively zero-change passes |
 | `PI_JEV_KEEP_THRESHOLD` | `0.5` | Jev keep-probability threshold |
@@ -177,8 +205,8 @@ export PI_JEV_DIAGNOSTICS=1
 Example fields:
 
 ```text
-context: Pi≈49.8k / 65.5k (76.0%) · Jev trigger=75% · adaptive=80%/84% · native fallback=87.5%
-logical history≈41.2k / 65.5k (62.9%) · calls=18; this is what the model and next Jev pass see
+context: Pi≈49.8k / 65.5k (76.0%) · calibrated pressure=79.1% · Jev trigger=75% · adaptive=80%/84% · native fallback=87.5%
+logical history≈51.8k / 65.5k (79.1%) · calls=18; this is what the model and next Jev pass see
 persisted Pi transcript≈56.0k / 65.5k (85.4%) · calls=31; diagnostic only
 committed decisions: 20 total · drop_call=0 · drop_result=18 · keep=2 · deferred drop_call=11 · restored=0
 ```
