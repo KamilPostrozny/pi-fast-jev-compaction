@@ -88,6 +88,19 @@ test("native fallback still uses calibrated logical pressure safety check", () =
   assert.match(compactBlock, /Math\.max\(adjustedUsagePercent, estimatedPercent\)/);
 });
 
+
+test("transient Jev errors do not bypass fallback when committed logical history exists", () => {
+  const compactHook = blockBetween(
+    'pi.on("session_before_compact"',
+    'pi.on("session_compact"',
+  );
+  assert.match(compactHook, /canGuardNativeThreshold\s*\(\{/);
+  assert.match(compactHook, /committedDecisions:\s*state\.decisions\.size/);
+  assert.match(compactHook, /remoteHealthy/);
+  assert.doesNotMatch(compactHook, /const jevHealthy\s*=/);
+  assert.match(compactHook, /logicalGuardAvailable/);
+});
+
 test("Pi adapter TypeScript parses after type stripping", () => {
   assert.doesNotThrow(() => {
     stripTypeScriptTypes(source, { mode: "transform" });
