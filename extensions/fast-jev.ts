@@ -1254,7 +1254,7 @@ async function evaluateAtTurnEnd(
     state,
     eligibleNow.size,
     logicalTokens,
-    effectivePercent,
+    pressurePercent,
     forceRefresh ? ["forced"] : ["turn_end_threshold"],
   );
   diagnostics.record("evaluation_start", {
@@ -1264,7 +1264,9 @@ async function evaluateAtTurnEnd(
     logicalCalls: calls.length,
     committedBefore: state.decisions.size,
     logicalTokens,
-    effectivePercent: effectivePercent === null ? null : Number(effectivePercent.toFixed(2)),
+    pressurePercent: pressurePercent === null ? null : Number(pressurePercent.toFixed(2)),
+    piPercent:
+      pressure.providerPercent === undefined ? null : Number(pressure.providerPercent.toFixed(2)),
     newEligibleCalls: newEligibleIds.size,
     newEligibleResultTokens,
     requiredNewResultTokens: requiredResultTokens,
@@ -1407,14 +1409,14 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
   };
 
   diagnostics.record("extension_loaded", {
-    version: "0.5.0",
+    version: "0.6.0",
     compactAtPercent: config.compactAtPercent,
     nativeFallbackPercent: config.nativeFallbackPercent,
     reevaluateMidPercent: config.reevaluateMidPercent,
     reevaluateUrgentPercent: config.reevaluateUrgentPercent,
-    reevaluateLowResultTokens: config.reevaluateLowResultTokens,
-    reevaluateMidResultTokens: config.reevaluateMidResultTokens,
-    reevaluateUrgentResultTokens: config.reevaluateUrgentResultTokens,
+    reevaluateLowResultPercent: config.reevaluateLowResultPercent,
+    reevaluateMidResultPercent: config.reevaluateMidResultPercent,
+    reevaluateUrgentResultPercent: config.reevaluateUrgentResultPercent,
     minReductionRatio: config.minReductionRatio,
     requestTimeoutMs: config.requestTimeoutMs,
     evaluationTimeoutMs: config.evaluationTimeoutMs,
