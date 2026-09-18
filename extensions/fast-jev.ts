@@ -855,12 +855,71 @@ function breakerActive(state: RuntimeState): boolean {
   return Date.now() < state.breakerUntilMs;
 }
 
+interface LocalFileOps {
+  read: Set<string>;
+  written: Set<string>;
+  edited: Set<string>;
+}
+
+function createLocalFileOps(): LocalFileOps {
+  return { read: new Set(), written: new Set(), edited: new Set() };
+}
+
+function extractLocalFileOps(message: AgentMessage, fileOps: LocalFileOps): void {
+  if (message.role !== "assistant" || !Array.isArray(message.content)) return;
+  for (const block of message.content) {
+    if (block.type !== "toolCall") continue;
+    const args = block.arguments as Record<string, unknown> | undefined;
+    const path = args && typeof args.path === "string" ? args.path : undefined;
+    if (!path) continue;
+    if (block.name === "read") fileOps.read.add(path);
+    else if (block.name === "write") fileOps.written.add(path);
+    else if (block.name === "edit") fileOps.edited.add(path);
+  }
+}
+
+function rebuildCompactionFileOps(
+  messages: readonly AgentMessage[],
+  branchEntries: readonly unknown[],
+): LocalFileOps {
+  const fileOps = createLocalFileOps();
+
+  // Preserve Pi's file metadata from the latest native compaction, then add
+  // only operations that survive Jev pruning. This avoids importing Pi
+  // internal helpers that are not part of the public extension API.
+  for (let i = branchEntries.length - 1; i >= 0; i--) {
+    const entry = branchEntries[i] as {
+      type?: string;
+      fromHook?: boolean;
+      details?: { readFiles?: unknown; modifiedFiles?: unknown };
+    };
+    if (entry.type !== "compaction") continue;
+    if (!entry.fromHook && entry.details) {
+      if (Array.isArray(entry.details.readFiles)) {
+        for (const path of entry.details.readFiles) {
+          if (typeof path === "string") fileOps.read.add(path);
+        }
+      }
+      if (Array.isArray(entry.details.modifiedFiles)) {
+        for (const path of entry.details.modifiedFiles) {
+          if (typeof path === "string") fileOps.edited.add(path);
+        }
+      }
+    }
+    break;
+  }
+
+  for (const message of messages) extractLocalFileOps(message, fileOps);
+  return fileOps;
+}
+
 function sanitizeCompactionPreparation(
   preparation: {
     messagesToSummarize: AgentMessage[];
     turnPrefixMessages: AgentMessage[];
-    fileOps: ReturnType<typeof createFileOps>;
+    fileOps: LocalFileOps;
   },
+  branchEntries: readonly unknown[],
   decisions: ReadonlyMap<string, CachedDecision>,
   truncateHeadChars: number,
 ): ApplyStats {
@@ -880,14 +939,10 @@ function sanitizeCompactionPreparation(
 
   preparation.messagesToSummarize = history.messages;
   preparation.turnPrefixMessages = prefix.messages;
-
-  // Pi appends file-operation metadata to its summary. Rebuild it from the
-  // sanitized messages so a dropped tool call cannot leak back via a filename.
-  const fileOps = createFileOps();
-  for (const message of [...history.messages, ...prefix.messages]) {
-    extractFileOpsFromMessage(message, fileOps);
-  }
-  preparation.fileOps = fileOps;
+  preparation.fileOps = rebuildCompactionFileOps(
+    [...history.messages, ...prefix.messages],
+    branchEntries,
+  );
 
   return {
     droppedCalls: history.stats.droppedCalls + prefix.stats.droppedCalls,
@@ -899,12 +954,11 @@ function sanitizeCompactionPreparation(
 }
 
 function logicalContextAtCompaction(
-  branchEntries: Parameters<typeof buildSessionContext>[0],
   ctx: ExtensionContext,
   state: RuntimeState,
   truncateHeadChars: number,
-): { tokens: number; messages: number } {
-  const raw = buildSessionContext(branchEntries).messages;
+): { tokens: number; messages: number; percent: number | null } {
+  const raw = ctx.sessionManager.buildSessionContext().messages;
   const logical = applyDecisionsDetailed(
     raw,
     state.decisions,
@@ -912,9 +966,12 @@ function logicalContextAtCompaction(
     truncateHeadChars,
   ).messages;
   const projection = projectMessages(logical);
+  const tokens = rawTokenEstimate(projection.messages, ctx);
+  const contextWindow = ctx.getContextUsage()?.contextWindow ?? ctx.model?.contextWindow;
   return {
-    tokens: rawTokenEstimate(projection.messages, ctx),
+    tokens,
     messages: logical.length,
+    percent: contextWindow && contextWindow > 0 ? (tokens / contextWindow) * 100 : null,
   };
 }
 
