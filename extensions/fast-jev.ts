@@ -1090,6 +1090,9 @@ async function evaluateAtTurnEnd(
   for (const id of [...state.deferredDropCalls.keys()]) {
     if (!rawIds.has(id)) state.deferredDropCalls.delete(id);
   }
+  for (const id of [...state.lastEvaluatedEligibleIds]) {
+    if (!rawIds.has(id)) state.lastEvaluatedEligibleIds.delete(id);
+  }
 
   const logicalBefore = applyDecisionsDetailed(
     rawMessages,
@@ -1103,7 +1106,11 @@ async function evaluateAtTurnEnd(
     projection.protectedToolCallIds,
   );
   const eligibleNow = eligibleToolIds(calls);
-  const unscored = hasUnscoredEligibleCall(calls, state);
+  const previouslyEvaluatedNow = new Set(
+    [...state.lastEvaluatedEligibleIds].filter((id) => eligibleNow.has(id)),
+  );
+  const newEligibleIds = newEligibleToolIds(eligibleNow, state.lastEvaluatedEligibleIds);
+  const newEligibleResultTokens = toolResultTokenVolume(projection.messages, newEligibleIds);
 
   const usage = ctx.getContextUsage();
   const contextWindow = usage?.contextWindow ?? ctx.model?.contextWindow;
@@ -1111,6 +1118,8 @@ async function evaluateAtTurnEnd(
   const logicalPercent =
     contextWindow && contextWindow > 0 ? (logicalTokens / contextWindow) * 100 : null;
   const effectivePercent = usage?.percent ?? logicalPercent;
+  const policy = evaluationPolicy(config);
+  const requiredResultTokens = requiredNewResultTokens(effectivePercent, policy);
 
   state.lastPiTokens = usage?.tokens ?? undefined;
   state.lastPiPercent = effectivePercent ?? undefined;
@@ -1118,23 +1127,33 @@ async function evaluateAtTurnEnd(
   state.lastLogicalTokens = logicalTokens;
   state.lastLogicalPercent = logicalPercent ?? undefined;
   state.lastLogicalToolCalls = calls.length;
+  state.lastNewEligibleResultTokens = newEligibleResultTokens;
+  state.lastRequiredNewResultTokens = requiredResultTokens;
   state.active = effectivePercent !== null && effectivePercent >= config.compactAtPercent;
 
   const forceRefresh = state.forceRefresh;
-  const shouldEvaluate = shouldEvaluateAtTurnEnd(
+  const shouldEvaluate = shouldEvaluateAtTurnEnd({
     effectivePercent,
-    config.compactAtPercent,
     forceRefresh,
-    forceRefresh ? eligibleNow.size > 0 : unscored,
-  );
+    eligibleCalls: eligibleNow.size,
+    previouslyEvaluatedCalls: previouslyEvaluatedNow.size,
+    newEligibleCalls: newEligibleIds.size,
+    newEligibleResultTokens,
+    policy,
+  });
 
   diagnostics.record("turn_evaluation_check", {
     turnIndex,
     effectivePercent: effectivePercent === null ? null : Number(effectivePercent.toFixed(2)),
     logicalPercent: logicalPercent === null ? null : Number(logicalPercent.toFixed(2)),
     triggerPercent: config.compactAtPercent,
+    midPercent: config.reevaluateMidPercent,
+    urgentPercent: config.reevaluateUrgentPercent,
     eligible: eligibleNow.size,
-    unscored,
+    previouslyEvaluatedEligible: previouslyEvaluatedNow.size,
+    newEligibleCalls: newEligibleIds.size,
+    newEligibleResultTokens,
+    requiredNewResultTokens: requiredResultTokens,
     forced: forceRefresh,
     shouldEvaluate,
     committed: state.decisions.size,
