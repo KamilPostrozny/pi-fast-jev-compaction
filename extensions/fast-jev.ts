@@ -1218,6 +1218,9 @@ async function evaluateAtTurnEnd(
     committedBefore: state.decisions.size,
     logicalTokens,
     effectivePercent: effectivePercent === null ? null : Number(effectivePercent.toFixed(2)),
+    newEligibleCalls: newEligibleIds.size,
+    newEligibleResultTokens,
+    requiredNewResultTokens: requiredResultTokens,
     timeoutMs: config.evaluationTimeoutMs,
   });
 
@@ -1231,6 +1234,7 @@ async function evaluateAtTurnEnd(
       diagnostics,
       state,
     );
+    state.lastEvaluatedEligibleIds = new Set(eligibleNow);
     const upstreamRatio = reductionRatio(evaluation.result);
     const activeMaps = activeDecisionMaps(evaluation.result, evaluation.calls);
     const effectiveRatio = activeReductionRatio(
@@ -1245,7 +1249,7 @@ async function evaluateAtTurnEnd(
 
       // Only the latest accepted evaluation controls which full deletions are
       // eligible for promotion at agent_end. Until then every such call remains
-      // as a breadcrumb with at most its result truncated.
+      // as a breadcrumb while its result contents are explicitly pruned.
       for (const call of evaluation.calls) {
         if (!call.pinned) state.deferredDropCalls.delete(call.tool_use_id);
       }
@@ -1298,6 +1302,9 @@ async function evaluateAtTurnEnd(
       committedBefore: beforeMerge.size,
       committedAfter: state.decisions.size,
       deferredDropCalls: state.deferredDropCalls.size,
+      evaluatedEligibleBaseline: state.lastEvaluatedEligibleIds.size,
+      newEligibleResultTokens,
+      requiredNewResultTokens: requiredResultTokens,
       actions: countActions(evaluation.result),
       accepted,
     });
