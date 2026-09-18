@@ -1001,6 +1001,237 @@ function failOpen(
   notify(ctx, `fast-jev-compaction: ${state.lastError}; keeping previously compacted logical history`, "warning");
 }
 
+async function evaluateAtTurnEnd(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  config: Config,
+  diagnostics: Diagnostics,
+  state: RuntimeState,
+  turnIndex: number,
+): Promise<void> {
+  if (!state.enabled) return;
+
+  const rawMessages = ctx.sessionManager.buildSessionContext().messages;
+  const rawIds = rawToolCallIds(rawMessages);
+
+  if ([...state.decisions.keys()].some((id) => !rawIds.has(id))) {
+    state.decisions = new Map([...state.decisions].filter(([id]) => rawIds.has(id)));
+  }
+  for (const id of [...state.deferredDropCalls.keys()]) {
+    if (!rawIds.has(id)) state.deferredDropCalls.delete(id);
+  }
+
+  const logicalBefore = applyDecisionsDetailed(
+    rawMessages,
+    state.decisions,
+    decisionIds(state.decisions),
+    config.truncateHeadChars,
+  ).messages;
+  const projection = projectMessages(logicalBefore);
+  const calls = collectToolCalls(
+    projection.messages,
+    config.preserveRecentMessages,
+    projection.protectedToolCallIds,
+  );
+  const eligibleNow = eligibleToolIds(calls);
+  const unscored = hasUnscoredEligibleCall(calls, state);
+
+  const usage = ctx.getContextUsage();
+  const contextWindow = usage?.contextWindow ?? ctx.model?.contextWindow;
+  const logicalTokens = rawTokenEstimate(projection.messages, ctx);
+  const logicalPercent =
+    contextWindow && contextWindow > 0 ? (logicalTokens / contextWindow) * 100 : null;
+  const effectivePercent = usage?.percent ?? logicalPercent;
+
+  state.lastPiTokens = usage?.tokens ?? undefined;
+  state.lastPiPercent = effectivePercent ?? undefined;
+  state.lastContextWindow = contextWindow;
+  state.lastLogicalTokens = logicalTokens;
+  state.lastLogicalPercent = logicalPercent ?? undefined;
+  state.lastLogicalToolCalls = calls.length;
+  state.active = effectivePercent !== null && effectivePercent >= config.compactAtPercent;
+
+  const forceRefresh = state.forceRefresh;
+  const shouldEvaluate = shouldEvaluateAtTurnEnd(
+    effectivePercent,
+    config.compactAtPercent,
+    forceRefresh,
+    forceRefresh ? eligibleNow.size > 0 : unscored,
+  );
+
+  diagnostics.record("turn_evaluation_check", {
+    turnIndex,
+    effectivePercent: effectivePercent === null ? null : Number(effectivePercent.toFixed(2)),
+    logicalPercent: logicalPercent === null ? null : Number(logicalPercent.toFixed(2)),
+    triggerPercent: config.compactAtPercent,
+    eligible: eligibleNow.size,
+    unscored,
+    forced: forceRefresh,
+    shouldEvaluate,
+    committed: state.decisions.size,
+    deferredDropCalls: state.deferredDropCalls.size,
+  });
+
+  if (!shouldEvaluate) {
+    updateStatus(ctx, state);
+    return;
+  }
+  if (state.evaluating) {
+    diagnostics.record("evaluation_skipped", { turnIndex, reason: "already_evaluating" });
+    return;
+  }
+  if (Date.now() < state.retryAfterMs) {
+    diagnostics.record("evaluation_skipped", {
+      turnIndex,
+      reason: "retry_backoff",
+      retryRemainingMs: state.retryAfterMs - Date.now(),
+    });
+    return;
+  }
+  if (breakerActive(state)) {
+    diagnostics.record("evaluation_skipped", {
+      turnIndex,
+      reason: "circuit_breaker",
+      breakerRemainingMs: state.breakerUntilMs - Date.now(),
+    });
+    return;
+  }
+
+  const key = process.env.TYPESAFE_API_KEY?.trim();
+  if (!key) {
+    state.lastError = "TYPESAFE_API_KEY is not configured";
+    state.insufficient = true;
+    if (!state.notifiedMissingKey) {
+      notify(ctx, "fast-jev-compaction: TYPESAFE_API_KEY is not configured; Pi native compaction remains enabled", "warning");
+      state.notifiedMissingKey = true;
+    }
+    diagnostics.record("evaluation_skipped", { turnIndex, reason: "missing_api_key" });
+    updateStatus(ctx, state);
+    return;
+  }
+
+  state.evaluating = true;
+  state.forceRefresh = false;
+  state.evaluationAttempts += 1;
+  state.lastEvaluationEligible = eligibleNow.size;
+  showEvaluationActivity(
+    ctx,
+    state,
+    eligibleNow.size,
+    logicalTokens,
+    effectivePercent,
+    forceRefresh ? ["forced"] : ["turn_end_threshold"],
+  );
+  diagnostics.record("evaluation_start", {
+    turnIndex,
+    mode: "active_result_only",
+    eligible: eligibleNow.size,
+    logicalCalls: calls.length,
+    committedBefore: state.decisions.size,
+    logicalTokens,
+    effectivePercent: effectivePercent === null ? null : Number(effectivePercent.toFixed(2)),
+    timeoutMs: config.evaluationTimeoutMs,
+  });
+
+  try {
+    const evaluation = await evaluate(
+      projection,
+      calls,
+      logicalTokens,
+      config,
+      logicalBefore,
+      diagnostics,
+      state,
+    );
+    const upstreamRatio = reductionRatio(evaluation.result);
+    const activeMaps = activeDecisionMaps(evaluation.result, evaluation.calls);
+    const effectiveRatio = activeReductionRatio(
+      logicalBefore,
+      activeMaps.committed,
+      config.truncateHeadChars,
+    );
+    const accepted = acceptsReduction(effectiveRatio, config.minReductionRatio);
+    const beforeMerge = new Map(state.decisions);
+
+    if (accepted) {
+      state.decisions = mergeMonotonicDecisions(beforeMerge, activeMaps.committed, rawIds);
+
+      // Only the latest accepted evaluation controls which full deletions are
+      // eligible for promotion at agent_end. Until then every such call remains
+      // as a breadcrumb with at most its result truncated.
+      for (const call of evaluation.calls) {
+        if (!call.pinned) state.deferredDropCalls.delete(call.tool_use_id);
+      }
+      for (const [id, decision] of activeMaps.deferredDropCalls) {
+        if (rawIds.has(id)) state.deferredDropCalls.set(id, decision);
+      }
+
+      persistLogicalState(pi, diagnostics, state, "turn_end_result_only");
+    }
+
+    state.lastResult = evaluation.result;
+    state.lastEffectiveReduction = effectiveRatio;
+    state.lastEvaluationMode = "active_result_only";
+    state.lastError = undefined;
+    state.retryAfterMs = 0;
+    state.insufficient = !accepted;
+    state.consecutiveFailures = 0;
+    state.breakerUntilMs = 0;
+    state.lastSuccessMs = accepted ? Date.now() : state.lastSuccessMs;
+    state.lastEvaluationMs = evaluation.durationMs;
+    state.lastEvaluationRequests = evaluation.result.stats.requests;
+    state.evaluationSuccesses += 1;
+
+    if (accepted) {
+      const applied = applyDecisionsDetailed(
+        rawMessages,
+        state.decisions,
+        decisionIds(state.decisions),
+        config.truncateHeadChars,
+      );
+      const postProjection = projectMessages(applied.messages);
+      const postTokens = rawTokenEstimate(postProjection.messages, ctx);
+      state.lastLogicalTokens = postTokens;
+      state.lastLogicalPercent =
+        contextWindow && contextWindow > 0 ? (postTokens / contextWindow) * 100 : undefined;
+      state.lastApply = applied.stats;
+    }
+
+    const downgradedDropCalls = [...activeMaps.deferredDropCalls].length;
+    diagnostics.record("evaluation_success", {
+      turnIndex,
+      mode: "active_result_only",
+      durationMs: evaluation.durationMs,
+      upstreamReduction: Number(upstreamRatio.toFixed(4)),
+      effectiveReduction: Number(effectiveRatio.toFixed(4)),
+      requests: evaluation.result.stats.requests,
+      stateTokens: evaluation.result.stats.stateTokens,
+      stateStage: evaluation.result.stats.stateStage,
+      proposedDecisions: activeMaps.committed.size,
+      downgradedDropCalls,
+      committedBefore: beforeMerge.size,
+      committedAfter: state.decisions.size,
+      deferredDropCalls: state.deferredDropCalls.size,
+      actions: countActions(evaluation.result),
+      accepted,
+    });
+  } catch (error) {
+    failOpen(ctx, diagnostics, state, error, undefined, config.retryDelayMs);
+    if (state.consecutiveFailures >= config.circuitBreakerFailures) {
+      state.breakerUntilMs = Date.now() + config.circuitBreakerMs;
+      diagnostics.record("circuit_breaker_open", {
+        turnIndex,
+        failures: state.consecutiveFailures,
+        breakerMs: config.circuitBreakerMs,
+      });
+    }
+  } finally {
+    state.evaluating = false;
+    clearEvaluationActivity(ctx);
+    updateStatus(ctx, state);
+  }
+}
+
 export default function fastJevCompaction(pi: ExtensionAPI): void {
   const config = resolveConfig();
   const diagnostics = new Diagnostics({
