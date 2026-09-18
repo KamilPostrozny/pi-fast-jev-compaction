@@ -1396,98 +1396,97 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
   });
 
   pi.on("session_before_compact", (event, ctx) => {
-    let sanitized: ApplyStats | undefined;
-    if (state.enabled && state.decisions.size > 0) {
-      sanitized = sanitizeCompactionPreparation(
-        event.preparation,
-        state.decisions,
+    try {
+      const hasKey = Boolean(process.env.TYPESAFE_API_KEY?.trim());
+      const jevHealthy =
+        state.enabled &&
+        hasKey &&
+        !breakerActive(state) &&
+        !state.lastError;
+
+      const logical = logicalContextAtCompaction(
+        ctx,
+        state,
         config.truncateHeadChars,
       );
-      diagnostics.record("native_compaction_sanitized", {
-        reason: event.reason,
-        committed: state.decisions.size,
-        ...sanitized,
-      });
-    }
 
-    if (!state.enabled || event.reason !== "threshold") {
+      if (
+        event.reason === "threshold" &&
+        shouldDelayNativeThreshold(
+          logical.percent,
+          config.nativeFallbackPercent,
+          jevHealthy,
+        )
+      ) {
+        state.thresholdCancelledCount += 1;
+        diagnostics.record("before_compact", {
+          reason: event.reason,
+          outcome: "cancel_until_native_fallback",
+          willRetry: event.willRetry,
+          logicalTokens: logical.tokens,
+          logicalMessages: logical.messages,
+          logicalPercent:
+            logical.percent === null ? null : Number(logical.percent.toFixed(2)),
+          jevTriggerPercent: config.compactAtPercent,
+          nativeFallbackPercent: config.nativeFallbackPercent,
+          committed: state.decisions.size,
+          deferredDropCalls: state.deferredDropCalls.size,
+          thresholdCancelledCount: state.thresholdCancelledCount,
+        });
+        updateStatus(ctx, state);
+        return { cancel: true };
+      }
+
+      let sanitized: ApplyStats | undefined;
+      if (state.enabled && state.decisions.size > 0) {
+        sanitized = sanitizeCompactionPreparation(
+          event.preparation as typeof event.preparation & { fileOps: LocalFileOps },
+          event.branchEntries,
+          state.decisions,
+          config.truncateHeadChars,
+        );
+        diagnostics.record("native_compaction_sanitized", {
+          reason: event.reason,
+          committed: state.decisions.size,
+          ...sanitized,
+        });
+      }
+
+      if (event.reason === "threshold") state.thresholdPassedCount += 1;
       diagnostics.record("before_compact", {
         reason: event.reason,
-        outcome: state.enabled && sanitized ? "pass_sanitized" : "pass",
-        enabled: state.enabled,
-        willRetry: event.willRetry,
-        sanitized,
-      });
-      return;
-    }
-
-    state.active = true;
-    state.forceRefresh = true;
-
-    const hasKey = Boolean(process.env.TYPESAFE_API_KEY?.trim());
-    const contextWindow = ctx.getContextUsage()?.contextWindow ?? ctx.model?.contextWindow;
-    const logical = logicalContextAtCompaction(
-      event.branchEntries,
-      ctx,
-      state,
-      config.truncateHeadChars,
-    );
-    const nativeLimit =
-      contextWindow && contextWindow > 0
-        ? Math.max(0, contextWindow - event.preparation.settings.reserveTokens)
-        : undefined;
-    const hasHeadroom = hasNativeHeadroom(
-      logical.tokens,
-      contextWindow,
-      event.preparation.settings.reserveTokens,
-    );
-    const healthy =
-      hasKey &&
-      !breakerActive(state) &&
-      !state.lastError &&
-      !state.insufficient &&
-      state.decisions.size > 0 &&
-      hasHeadroom;
-
-    if (!healthy) {
-      state.thresholdPassedCount += 1;
-      diagnostics.record("before_compact", {
-        reason: event.reason,
-        outcome: "pass_native_sanitized",
+        outcome:
+          event.reason === "threshold"
+            ? "pass_native_fallback"
+            : sanitized
+              ? "pass_native_sanitized"
+              : "pass_native",
         willRetry: event.willRetry,
         hasKey,
         breaker: breakerActive(state),
         lastError: state.lastError,
-        insufficient: state.insufficient,
-        committed: state.decisions.size,
         logicalTokens: logical.tokens,
         logicalMessages: logical.messages,
-        contextWindow,
-        nativeLimit,
-        hasHeadroom,
+        logicalPercent:
+          logical.percent === null ? null : Number(logical.percent.toFixed(2)),
+        nativeFallbackPercent: config.nativeFallbackPercent,
         sanitized,
         thresholdPassedCount: state.thresholdPassedCount,
       });
       updateStatus(ctx, state);
       return;
+    } catch (error) {
+      state.lastError = `native compaction hook: ${errorText(error)}`;
+      diagnostics.record("before_compact_error", {
+        reason: event.reason,
+        willRetry: event.willRetry,
+        error: errorText(error),
+        outcome: "fail_open_to_native",
+      });
+      updateStatus(ctx, state);
+      // Never let a Jev integration error disable Pi's built-in safety net.
+      return;
     }
-
-    state.thresholdCancelledCount += 1;
-    diagnostics.record("before_compact", {
-      reason: event.reason,
-      outcome: "cancel_for_jev_headroom",
-      willRetry: event.willRetry,
-      committed: state.decisions.size,
-      logicalTokens: logical.tokens,
-      logicalMessages: logical.messages,
-      contextWindow,
-      nativeLimit,
-      hasHeadroom,
-      sanitized,
-      thresholdCancelledCount: state.thresholdCancelledCount,
-    });
-    updateStatus(ctx, state);
-    return { cancel: true };
   });
 
   pi.on("session_compact", (event, ctx) => {
