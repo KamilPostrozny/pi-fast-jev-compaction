@@ -1073,7 +1073,7 @@ function logicalContextAtCompaction(
     state.decisions,
     decisionIds(state.decisions),
   );
-  const logical = appendGroundingReminder(applied.messages, applied.stats);
+  const logical = applied.messages;
   const projection = projectMessages(logical);
   const tokens = rawTokenEstimate(projection.messages, ctx);
   return {
@@ -1138,12 +1138,16 @@ async function evaluateAtTurnEnd(
     decisionIds(state.decisions),
   );
   const logicalBefore = appliedBefore.messages;
-  const modelFacingBefore = appendGroundingReminder(logicalBefore, appliedBefore.stats);
   const projection = projectMessages(logicalBefore);
+  const sourceEvidenceIds = latestReadEvidenceIds(logicalBefore);
+  const protectedIds = new Set([
+    ...projection.protectedToolCallIds,
+    ...sourceEvidenceIds,
+  ]);
   const calls = collectToolCalls(
     projection.messages,
     config.preserveRecentMessages,
-    projection.protectedToolCallIds,
+    protectedIds,
   );
   const eligibleNow = eligibleToolIds(calls);
   const previouslyEvaluatedNow = new Set(
@@ -1152,8 +1156,7 @@ async function evaluateAtTurnEnd(
   const newEligibleIds = newEligibleToolIds(eligibleNow, state.lastEvaluatedEligibleIds);
   const newEligibleResultTokens = toolResultTokenVolume(projection.messages, newEligibleIds);
 
-  const modelFacingProjection = projectMessages(modelFacingBefore);
-  const logicalTokens = rawTokenEstimate(modelFacingProjection.messages, ctx);
+  const logicalTokens = rawTokenEstimate(projection.messages, ctx);
   const pressure = pressureSnapshot(logicalTokens, ctx, state);
   const contextWindow = pressure.contextWindow;
   const logicalPercent = pressure.logicalPercent ?? null;
@@ -1195,8 +1198,8 @@ async function evaluateAtTurnEnd(
       pressure.providerPercent === undefined ? null : Number(pressure.providerPercent.toFixed(2)),
     logicalPercent: logicalPercent === null ? null : Number(logicalPercent.toFixed(2)),
     triggerPercent: config.compactAtPercent,
-    midPercent: config.reevaluateMidPercent,
-    urgentPercent: config.reevaluateUrgentPercent,
+    nativeFallbackPercent: config.nativeFallbackPercent,
+    protectedReadEvidence: sourceEvidenceIds.size,
     eligible: eligibleNow.size,
     previouslyEvaluatedEligible: previouslyEvaluatedNow.size,
     newEligibleCalls: newEligibleIds.size,
@@ -1410,14 +1413,9 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
   };
 
   diagnostics.record("extension_loaded", {
-    version: "0.6.0",
+    version: "0.6.1",
     compactAtPercent: config.compactAtPercent,
     nativeFallbackPercent: config.nativeFallbackPercent,
-    reevaluateMidPercent: config.reevaluateMidPercent,
-    reevaluateUrgentPercent: config.reevaluateUrgentPercent,
-    reevaluateLowResultPercent: config.reevaluateLowResultPercent,
-    reevaluateMidResultPercent: config.reevaluateMidResultPercent,
-    reevaluateUrgentResultPercent: config.reevaluateUrgentResultPercent,
     minReductionRatio: config.minReductionRatio,
     requestTimeoutMs: config.requestTimeoutMs,
     evaluationTimeoutMs: config.evaluationTimeoutMs,
@@ -1465,13 +1463,18 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
         state.decisions,
         decisionIds(state.decisions),
       );
-      const logicalMessages = appendGroundingReminder(applied.messages, applied.stats);
+      const logicalMessages = applied.messages;
       const grossProjection = projectMessages(event.messages);
       const logicalProjection = projectMessages(logicalMessages);
+      const sourceEvidenceIds = latestReadEvidenceIds(logicalMessages);
+      const logicalProtectedIds = new Set([
+        ...logicalProjection.protectedToolCallIds,
+        ...sourceEvidenceIds,
+      ]);
       const logicalCalls = collectToolCalls(
         logicalProjection.messages,
         config.preserveRecentMessages,
-        logicalProjection.protectedToolCallIds,
+        logicalProtectedIds,
       );
 
       const grossTokens = rawTokenEstimate(grossProjection.messages, ctx);
@@ -1524,10 +1527,7 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
         piTokens: pressure.providerTokens ?? null,
         piPercent:
           pressure.providerPercent === undefined ? null : Number(pressure.providerPercent.toFixed(2)),
-        groundingReminder:
-          applied.stats.prunedResults > 0 ||
-          applied.stats.droppedResults > 0 ||
-          applied.stats.droppedCalls > 0,
+        protectedReadEvidence: sourceEvidenceIds.size,
         compactAtPercent: config.compactAtPercent,
         ...applied.stats,
         durationMs: Date.now() - hookStarted,
@@ -1713,12 +1713,12 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
       : `unknown${rawWindow}`;
     const lines = [
       `fast-jev-compaction: enabled=${state.enabled} · at-threshold=${state.active} · evaluating=${state.evaluating}`,
-      `context: Pi≈${piContext} · calibrated pressure=${state.lastPressurePercent === undefined ? "unknown" : `${state.lastPressurePercent.toFixed(1)}%`} · Jev trigger=${config.compactAtPercent}% · adaptive=${config.reevaluateMidPercent}%/${config.reevaluateUrgentPercent}% · native fallback=${config.nativeFallbackPercent}%`,
+      `context: Pi≈${piContext} · calibrated pressure=${state.lastPressurePercent === undefined ? "unknown" : `${state.lastPressurePercent.toFixed(1)}%`} · Jev trigger=${config.compactAtPercent}% · native fallback=${config.nativeFallbackPercent}%`,
       `logical history≈${logicalContext} · calls=${state.lastLogicalToolCalls ?? "n/a"}; this is what the model and next Jev pass see`,
       `persisted Pi transcript≈${formatTokens(state.lastRawTokens ?? 0)}${rawWindow} (${(state.lastRawPercent ?? 0).toFixed(1)}%) · calls=${state.lastGrossToolCalls ?? "n/a"}; diagnostic only`,
       `committed decisions: ${state.decisions.size} total · drop_call=${committedDropCalls} · drop_result=${committedDropResults} · keep=${committedKeeps} · deferred drop_call=${state.deferredDropCalls.size} · restored=${state.restoredDecisionCount}`,
       `evaluations: ${state.evaluationSuccesses}/${state.evaluationAttempts} successful · Jev HTTP requests=${state.totalHttpRequests} total${state.lastEvaluationRequests !== undefined ? ` (last pass=${state.lastEvaluationRequests})` : ""}`,
-      `reevaluation: new result≈${formatTokens(state.lastNewEligibleResultTokens ?? 0)} tokens · required=${state.lastRequiredNewResultTokens === null || state.lastRequiredNewResultTokens === undefined ? "n/a" : formatTokens(state.lastRequiredNewResultTokens)} · gates=${config.reevaluateLowResultPercent}%/${config.reevaluateMidResultPercent}%/${config.reevaluateUrgentResultPercent}% of window · baseline calls=${state.lastEvaluatedEligibleIds.size}`,
+      `reevaluation: new result≈${formatTokens(state.lastNewEligibleResultTokens ?? 0)} tokens · required=${state.lastRequiredNewResultTokens === null || state.lastRequiredNewResultTokens === undefined ? "n/a" : formatTokens(state.lastRequiredNewResultTokens)} · derived from min-reduction/headroom · baseline calls=${state.lastEvaluatedEligibleIds.size}`,
       result
         ? `last pass: mode=${state.lastEvaluationMode ?? "n/a"} · effective reduction=${state.lastEffectiveReduction === undefined ? "n/a" : percent(state.lastEffectiveReduction)} · upstream=${percent(reductionRatio(result))} · eligible=${state.lastEvaluationEligible ?? "n/a"} · ${state.lastEvaluationMs ?? "n/a"}ms · Jev state≈${formatTokens(result.stats.stateTokens)} (${result.stats.stateStage || "n/a"})`
         : "last pass: n/a",
