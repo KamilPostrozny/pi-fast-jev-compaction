@@ -1,5 +1,11 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import {
+  buildSessionContext,
+  createFileOps,
+  extractFileOpsFromMessage,
+  type ExtensionAPI,
+  type ExtensionContext,
+} from "@earendil-works/pi-coding-agent";
 import {
   collectToolCalls,
   compactMessages,
@@ -11,6 +17,11 @@ import {
   type ToolCall as JevToolCall,
 } from "./fast-jev-core.ts";
 import { Diagnostics, summarizeDiagnostic } from "./diagnostics.ts";
+import {
+  acceptsReduction,
+  hasNativeHeadroom,
+  shouldRefreshSettledEligible,
+} from "./policy.ts";
 
 const STATUS_KEY = "fast-jev";
 const STATE_ENTRY_TYPE = "fast-jev-compaction-state";
@@ -32,7 +43,6 @@ export interface Config {
   retryDelayMs: number;
   circuitBreakerFailures: number;
   circuitBreakerMs: number;
-  successfulPassFreshMs: number;
   diagnostics: boolean;
   diagnosticsFile?: string;
   diagnosticsStderr: boolean;
@@ -52,7 +62,6 @@ const DEFAULTS: Config = {
   retryDelayMs: 30_000,
   circuitBreakerFailures: 2,
   circuitBreakerMs: 120_000,
-  successfulPassFreshMs: 300_000,
   diagnostics: true,
   diagnosticsStderr: false,
 };
@@ -149,6 +158,8 @@ interface RuntimeState {
   lastProviderRequestMs?: number;
   lastProviderDurationMs?: number;
   lastProviderStatus?: number;
+  settledGeneration: number;
+  lastEvaluatedSettledGeneration: number;
 }
 
 function envNumber(name: string, fallback: number): number {
@@ -209,10 +220,6 @@ export function resolveConfig(): Config {
       1_000,
       Math.floor(envNumber("PI_JEV_CIRCUIT_BREAKER_MS", DEFAULTS.circuitBreakerMs)),
     ),
-    successfulPassFreshMs: Math.max(
-      1_000,
-      Math.floor(envNumber("PI_JEV_SUCCESS_FRESH_MS", DEFAULTS.successfulPassFreshMs)),
-    ),
     diagnostics: envBoolean("PI_JEV_DIAGNOSTICS", DEFAULTS.diagnostics),
     diagnosticsStderr: envBoolean("PI_JEV_DIAGNOSTICS_STDERR", DEFAULTS.diagnosticsStderr),
   };
@@ -271,7 +278,7 @@ export function projectMessages(messages: readonly AgentMessage[]): Projection {
         const toolUses = message.content
           .filter(
             (block): block is Extract<(typeof message.content)[number], { type: "toolCall" }> =>
-              block.type === "toolCall" && !protectedToolCallIds.has(block.id),
+              block.type === "toolCall",
           )
           .map((block) => ({
             tool_use_id: block.id,
@@ -285,15 +292,15 @@ export function projectMessages(messages: readonly AgentMessage[]): Projection {
           role: "user",
           text: "",
           toolUses: [],
-          toolResults: protectedToolCallIds.has(message.toolCallId)
-            ? []
-            : [
-                {
-                  tool_use_id: message.toolCallId,
-                  text: textContent(message.content),
-                  isError: message.isError,
-                },
-              ],
+          toolResults: [
+            {
+              tool_use_id: message.toolCallId,
+              text: protectedToolCallIds.has(message.toolCallId)
+                ? "[image-bearing tool result protected from Jev pruning]"
+                : textContent(message.content),
+              isError: message.isError,
+            },
+          ],
         };
       case "user":
         return { role: "user", text: textContent(message.content), toolUses: [] };
@@ -699,6 +706,7 @@ async function evaluate(
       goal: config.goal ?? inferGoal(sourceMessages),
       keepThreshold: config.keepThreshold,
       preserveRecentMessages: config.preserveRecentMessages,
+      protectedToolUseIds: projected.protectedToolCallIds,
       maxStateTokens: config.maxStateTokens,
       maxRequestTokens: config.maxRequestTokens,
       truncateHeadChars: config.truncateHeadChars,
@@ -791,6 +799,69 @@ function breakerActive(state: RuntimeState): boolean {
   return Date.now() < state.breakerUntilMs;
 }
 
+function sanitizeCompactionPreparation(
+  preparation: {
+    messagesToSummarize: AgentMessage[];
+    turnPrefixMessages: AgentMessage[];
+    fileOps: ReturnType<typeof createFileOps>;
+  },
+  decisions: ReadonlyMap<string, CachedDecision>,
+  truncateHeadChars: number,
+): ApplyStats {
+  const ids = decisionIds(decisions);
+  const history = applyDecisionsDetailed(
+    preparation.messagesToSummarize,
+    decisions,
+    ids,
+    truncateHeadChars,
+  );
+  const prefix = applyDecisionsDetailed(
+    preparation.turnPrefixMessages,
+    decisions,
+    ids,
+    truncateHeadChars,
+  );
+
+  preparation.messagesToSummarize = history.messages;
+  preparation.turnPrefixMessages = prefix.messages;
+
+  // Pi appends file-operation metadata to its summary. Rebuild it from the
+  // sanitized messages so a dropped tool call cannot leak back via a filename.
+  const fileOps = createFileOps();
+  for (const message of [...history.messages, ...prefix.messages]) {
+    extractFileOpsFromMessage(message, fileOps);
+  }
+  preparation.fileOps = fileOps;
+
+  return {
+    droppedCalls: history.stats.droppedCalls + prefix.stats.droppedCalls,
+    droppedResults: history.stats.droppedResults + prefix.stats.droppedResults,
+    truncatedResults: history.stats.truncatedResults + prefix.stats.truncatedResults,
+    messagesBefore: history.stats.messagesBefore + prefix.stats.messagesBefore,
+    messagesAfter: history.stats.messagesAfter + prefix.stats.messagesAfter,
+  };
+}
+
+function logicalContextAtCompaction(
+  branchEntries: Parameters<typeof buildSessionContext>[0],
+  ctx: ExtensionContext,
+  state: RuntimeState,
+  truncateHeadChars: number,
+): { tokens: number; messages: number } {
+  const raw = buildSessionContext(branchEntries).messages;
+  const logical = applyDecisionsDetailed(
+    raw,
+    state.decisions,
+    decisionIds(state.decisions),
+    truncateHeadChars,
+  ).messages;
+  const projection = projectMessages(logical);
+  return {
+    tokens: rawTokenEstimate(projection.messages, ctx),
+    messages: logical.length,
+  };
+}
+
 function failOpen(
   ctx: ExtensionContext,
   diagnostics: Diagnostics,
@@ -847,10 +918,12 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
     totalHttpErrors: 0,
     totalHttpTimeouts: 0,
     providerRequestCount: 0,
+    settledGeneration: 0,
+    lastEvaluatedSettledGeneration: -1,
   };
 
   diagnostics.record("extension_loaded", {
-    version: "0.3.0",
+    version: "0.3.1",
     compactAtPercent: config.compactAtPercent,
     requestTimeoutMs: config.requestTimeoutMs,
     evaluationTimeoutMs: config.evaluationTimeoutMs,
@@ -905,7 +978,11 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
       const projectionStarted = Date.now();
       const grossProjection = projectMessages(event.messages);
       const projection = projectMessages(logicalMessagesBeforePass);
-      const calls = collectToolCalls(projection.messages, config.preserveRecentMessages);
+      const calls = collectToolCalls(
+        projection.messages,
+        config.preserveRecentMessages,
+        projection.protectedToolCallIds,
+      );
       const eligibleNow = eligibleToolIds(calls);
       const projectionMs = Date.now() - projectionStarted;
 
@@ -937,8 +1014,15 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
       const refreshReasons: string[] = [];
       if (state.forceRefresh) refreshReasons.push("forced");
       if (state.active && !wasAtThreshold) refreshReasons.push("threshold_crossed");
-      if (state.active && hasUnscoredEligibleCall(calls, state)) {
-        refreshReasons.push("threshold_unscored_eligible_call");
+      if (
+        shouldRefreshSettledEligible(
+          state.active,
+          state.settledGeneration,
+          state.lastEvaluatedSettledGeneration,
+          hasUnscoredEligibleCall(calls, state),
+        )
+      ) {
+        refreshReasons.push("settled_unscored_eligible_call");
       }
       const refreshNeeded = refreshReasons.length > 0 && eligibleNow.size > 0;
 
@@ -1013,6 +1097,7 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
       if (shouldEvaluate) {
         state.evaluating = true;
         state.forceRefresh = false;
+        state.lastEvaluatedSettledGeneration = state.settledGeneration;
         state.evaluationAttempts += 1;
         state.lastEvaluationEligible = eligibleNow.size;
         showEvaluationActivity(ctx, state, eligibleNow.size, logicalTokens, piPercent, refreshReasons);
@@ -1042,25 +1127,29 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
           const ratio = reductionRatio(evaluation.result);
           const proposed = decisionMap(evaluation.result, evaluation.calls);
           const beforeMerge = new Map(state.decisions);
-          state.decisions = mergeMonotonicDecisions(beforeMerge, proposed, rawIds);
+          const accepted = acceptsReduction(ratio, config.minReductionRatio);
+          if (accepted) {
+            state.decisions = mergeMonotonicDecisions(beforeMerge, proposed, rawIds);
+            persistLogicalState(pi, diagnostics, state, "jev_pass");
+          }
           state.lastResult = evaluation.result;
           state.lastError = undefined;
           state.retryAfterMs = 0;
-          state.insufficient = ratio < config.minReductionRatio;
+          state.insufficient = !accepted;
           state.consecutiveFailures = 0;
           state.breakerUntilMs = 0;
-          state.lastSuccessMs = Date.now();
+          state.lastSuccessMs = accepted ? Date.now() : state.lastSuccessMs;
           state.lastEvaluationMs = evaluation.durationMs;
           state.lastEvaluationRequests = evaluation.result.stats.requests;
           state.evaluationSuccesses += 1;
 
-          persistLogicalState(pi, diagnostics, state, "jev_pass");
-
           const committedAfter = state.decisions.size;
-          const newlyCommitted = [...state.decisions].filter(([id, decision]) => {
-            const previous = beforeMerge.get(id);
-            return !previous || ACTION_RANK[decision.action] > ACTION_RANK[previous.action];
-          }).length;
+          const newlyCommitted = accepted
+            ? [...state.decisions].filter(([id, decision]) => {
+                const previous = beforeMerge.get(id);
+                return !previous || ACTION_RANK[decision.action] > ACTION_RANK[previous.action];
+              }).length
+            : 0;
           diagnostics.record("evaluation_success", {
             hookId,
             durationMs: evaluation.durationMs,
@@ -1077,8 +1166,16 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
             newlyCommitted,
             actions: countActions(evaluation.result),
             insufficient: state.insufficient,
+            accepted,
           });
         } catch (error) {
+          // A failed pass did not consume this settled generation. Keep it
+          // eligible for retry after backoff instead of waiting for another
+          // complete agent turn.
+          state.lastEvaluatedSettledGeneration = Math.min(
+            state.lastEvaluatedSettledGeneration,
+            state.settledGeneration - 1,
+          );
           failOpen(ctx, diagnostics, state, error, hookId, config.retryDelayMs);
           if (state.consecutiveFailures >= config.circuitBreakerFailures) {
             state.breakerUntilMs = Date.now() + config.circuitBreakerMs;
@@ -1190,12 +1287,27 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
     }
   });
   pi.on("session_before_compact", (event, ctx) => {
+    let sanitized: ApplyStats | undefined;
+    if (state.enabled && state.decisions.size > 0) {
+      sanitized = sanitizeCompactionPreparation(
+        event.preparation,
+        state.decisions,
+        config.truncateHeadChars,
+      );
+      diagnostics.record("native_compaction_sanitized", {
+        reason: event.reason,
+        committed: state.decisions.size,
+        ...sanitized,
+      });
+    }
+
     if (!state.enabled || event.reason !== "threshold") {
       diagnostics.record("before_compact", {
         reason: event.reason,
-        outcome: "pass",
+        outcome: state.enabled && sanitized ? "pass_sanitized" : "pass",
         enabled: state.enabled,
         willRetry: event.willRetry,
+        sanitized,
       });
       return;
     }
@@ -1204,29 +1316,47 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
     state.forceRefresh = true;
 
     const hasKey = Boolean(process.env.TYPESAFE_API_KEY?.trim());
-    const freshSuccess =
-      state.lastSuccessMs > 0 && Date.now() - state.lastSuccessMs <= config.successfulPassFreshMs;
+    const contextWindow = ctx.getContextUsage()?.contextWindow ?? ctx.model?.contextWindow;
+    const logical = logicalContextAtCompaction(
+      event.branchEntries,
+      ctx,
+      state,
+      config.truncateHeadChars,
+    );
+    const nativeLimit =
+      contextWindow && contextWindow > 0
+        ? Math.max(0, contextWindow - event.preparation.settings.reserveTokens)
+        : undefined;
+    const hasHeadroom = hasNativeHeadroom(
+      logical.tokens,
+      contextWindow,
+      event.preparation.settings.reserveTokens,
+    );
     const healthy =
       hasKey &&
       !breakerActive(state) &&
       !state.lastError &&
       !state.insufficient &&
-      freshSuccess &&
-      state.lastResult !== undefined &&
-      state.decisions.size > 0;
+      state.decisions.size > 0 &&
+      hasHeadroom;
 
     if (!healthy) {
       state.thresholdPassedCount += 1;
       diagnostics.record("before_compact", {
         reason: event.reason,
-        outcome: "pass_native",
+        outcome: "pass_native_sanitized",
         willRetry: event.willRetry,
         hasKey,
         breaker: breakerActive(state),
         lastError: state.lastError,
         insufficient: state.insufficient,
-        freshSuccess,
         committed: state.decisions.size,
+        logicalTokens: logical.tokens,
+        logicalMessages: logical.messages,
+        contextWindow,
+        nativeLimit,
+        hasHeadroom,
+        sanitized,
         thresholdPassedCount: state.thresholdPassedCount,
       });
       updateStatus(ctx, state);
@@ -1236,10 +1366,15 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
     state.thresholdCancelledCount += 1;
     diagnostics.record("before_compact", {
       reason: event.reason,
-      outcome: "cancel_for_jev",
+      outcome: "cancel_for_jev_headroom",
       willRetry: event.willRetry,
       committed: state.decisions.size,
-      lastSuccessAgeMs: Date.now() - state.lastSuccessMs,
+      logicalTokens: logical.tokens,
+      logicalMessages: logical.messages,
+      contextWindow,
+      nativeLimit,
+      hasHeadroom,
+      sanitized,
       thresholdCancelledCount: state.thresholdCancelledCount,
     });
     updateStatus(ctx, state);
@@ -1247,17 +1382,22 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
   });
 
   pi.on("session_compact", (event, ctx) => {
-    state.decisions.clear();
+    // Do not clear decisions yet: Pi keeps a raw recent tail after compaction.
+    // Decisions for calls still in that tail must continue to apply. The next
+    // context hook reconciles away decisions whose tool IDs were summarized.
     state.forceRefresh = false;
+    state.active = false;
     state.insufficient = false;
     state.lastError = undefined;
     state.lastResult = undefined;
+    state.lastSuccessMs = 0;
     state.restoredDecisionCount = 0;
-    persistLogicalState(pi, diagnostics, state, "native_compaction");
+    persistLogicalState(pi, diagnostics, state, "native_compaction_tail");
     diagnostics.record("session_compact", {
       reason: event.reason,
       willRetry: event.willRetry,
       fromExtension: event.fromExtension,
+      retainedDecisionsUntilReconcile: state.decisions.size,
     });
     updateStatus(ctx, state);
   });
@@ -1397,7 +1537,9 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
   });
 
   pi.on("agent_settled", () => {
+    state.settledGeneration += 1;
     diagnostics.record("agent_settled", {
+      generation: state.settledGeneration,
       contextHookId: state.lastContextHookId,
       contextOutcome: state.lastContextOutcome,
     });

@@ -1,5 +1,5 @@
 /*
- * Vendored/adapted from tamaratran/fast-jev-compaction v0.2.0 (MIT).
+ * Vendored/adapted from tamaratran/fast-jev-compaction v0.3.0 (MIT).
  * Original project: https://github.com/tamaratran/fast-jev-compaction
  * See THIRD_PARTY_LICENSES.md.
  */
@@ -88,6 +88,8 @@ export interface CompactOptions {
   maxStateTokens?: number;
   maxRequestTokens?: number;
   truncateHeadChars?: number;
+  /** Tool calls that must stay visible to Jev but must never be candidates for pruning. */
+  protectedToolUseIds?: ReadonlySet<string>;
 }
 
 export interface ResolvedCompactOptions {
@@ -97,6 +99,7 @@ export interface ResolvedCompactOptions {
   maxStateTokens: number;
   maxRequestTokens: number;
   truncateHeadChars: number;
+  protectedToolUseIds: ReadonlySet<string>;
 }
 
 export interface CompactResult {
@@ -298,7 +301,11 @@ function isPinned(index: number, total: number, preserveRecentMessages: number):
   return index === 0 || index >= total - preserveRecentMessages;
 }
 
-export function collectToolCalls(messages: readonly Message[], preserveRecentMessages: number): ToolCall[] {
+export function collectToolCalls(
+  messages: readonly Message[],
+  preserveRecentMessages: number,
+  protectedToolUseIds: ReadonlySet<string> = new Set(),
+): ToolCall[] {
   const results = new Map<string, { index: number; result: ToolResult }>();
   messages.forEach((message, index) => {
     for (const result of message.toolResults ?? []) results.set(result.tool_use_id, { index, result });
@@ -318,6 +325,7 @@ export function collectToolCalls(messages: readonly Message[], preserveRecentMes
         resultChars: found.result.text.length,
         isError: found.result.isError ?? false,
         pinned:
+          protectedToolUseIds.has(tool.tool_use_id) ||
           isPinned(callIndex, messages.length, preserveRecentMessages) ||
           isPinned(found.index, messages.length, preserveRecentMessages),
       });
@@ -513,6 +521,7 @@ export const DEFAULT_OPTIONS: ResolvedCompactOptions = {
   maxStateTokens: 25_000,
   maxRequestTokens: 30_000,
   truncateHeadChars: 300,
+  protectedToolUseIds: new Set(),
 };
 
 const REQUEST_OVERHEAD_TOKENS = 20;
@@ -535,6 +544,7 @@ function resolveOptions(options: CompactOptions = {}): ResolvedCompactOptions {
       0,
       Math.floor(finite(options.truncateHeadChars, DEFAULT_OPTIONS.truncateHeadChars)),
     ),
+    protectedToolUseIds: options.protectedToolUseIds ?? DEFAULT_OPTIONS.protectedToolUseIds,
   };
 }
 
@@ -692,7 +702,7 @@ async function compact(
 ): Promise<CompactResult> {
   const started = Date.now();
   const resolved = resolveOptions(options);
-  const calls = collectToolCalls(messages, resolved.preserveRecentMessages);
+  const calls = collectToolCalls(messages, resolved.preserveRecentMessages, resolved.protectedToolUseIds);
   const candidates = calls.filter((call) => !call.pinned);
   const charsBefore = messages.reduce((sum, message) => sum + messageChars(message), 0);
 

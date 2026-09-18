@@ -1,6 +1,6 @@
 {
   "name": "pi-fast-jev-compaction",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Monotonic Jev context compaction for Pi with persisted logical history and diagnostics.",
   "type": "module",
   "license": "MIT",
@@ -18,5 +18,8 @@
     "extensions": [
       "./extensions/fast-jev.ts"
     ]
+  },
+  "scripts": {
+    "test": "node --test --experimental-strip-types tests/*.test.ts"
   }
 }

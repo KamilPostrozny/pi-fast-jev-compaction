@@ -4,6 +4,17 @@ A Pi package port of [`tamaratran/fast-jev-compaction`](https://github.com/tamar
 
 It uses TypeSafe Jev to decide, tool call by tool call, which old calls/results still need to remain in model context. User and assistant prose is not summarized or rewritten by this extension. Pi's persisted session transcript stays intact.
 
+## 0.3.1: upstream-semantic fixes
+
+0.3.1 closes the remaining correctness gaps between the Pi adapter and the upstream Claude plugin:
+
+- Jev passes below `PI_JEV_MIN_REDUCTION_RATIO` are now rejected without committing or persisting their proposed deletions.
+- Newly eligible tools no longer cause a fresh Jev request on every pre-LLM `context` hook. Above the trigger threshold, they are refreshed at most once per completed/settled agent generation.
+- Native Pi compaction is sanitized before Pi's built-in summarizer runs, so previously dropped calls/results cannot be reintroduced through the generated summary or file-operation metadata.
+- Jev decisions are retained across native compaction until the next context hook reconciles them against Pi's retained raw tail, preventing dropped calls in that tail from reappearing.
+- Pi threshold compaction is cancelled only when the current **logical** context is actually within Pi's native `contextWindow - reserveTokens` limit.
+- Image-bearing tool calls remain represented in Jev's history as pinned calls with a protected placeholder result instead of disappearing from Jev's causal state.
+
 ## 0.3.0: monotonic logical history
 
 0.3.0 fixes the largest semantic difference between the previous Pi port and the upstream project.
@@ -40,9 +51,9 @@ This preserves upstream `drop_call` semantics. 0.3.0 does **not** change Jev's d
 
 ### Native Pi compaction boundary
 
-Jev logical history is monotonic until Pi performs a real native compaction (`/compact`, overflow fallback, or an allowed native auto-compaction). After Pi writes a compaction summary, old tool IDs are no longer the active message history, so the extension records an empty logical-decision state and starts a new logical segment.
+Pi still persists the original transcript, but native compaction now respects the logical Jev history. Before Pi's built-in summarizer runs, the extension applies all committed Jev decisions to `messagesToSummarize` and `turnPrefixMessages`, then rebuilds file-operation metadata from those sanitized messages.
 
-That boundary is unavoidable with Pi's current API: `session_before_compact` can cancel compaction or provide a summary, but it cannot replace persisted history with an arbitrary pruned message list the way the upstream Claude function hook can.
+Pi may keep a raw recent tail after compaction. Destructive Jev decisions therefore remain active across the compaction event and are reconciled on the next `context` hook: IDs that were summarized disappear from the decision map, while IDs still present in the retained tail continue to be pruned. This prevents native compaction from resurrecting previously deleted tool context.
 
 ## Diagnostics and freeze protection
 
@@ -86,7 +97,7 @@ export PI_JEV_DIAGNOSTICS=1
 | Variable | Default | Meaning |
 | --- | ---: | --- |
 | `PI_JEV_COMPACT_AT_PERCENT` | `60` | Run Jev when Pi's effective context usage reaches this percentage; committed pruning keeps applying below it |
-| `PI_JEV_MIN_REDUCTION_RATIO` | `0.25` | Minimum incremental Jev reduction considered sufficient for cancelling Pi threshold compaction |
+| `PI_JEV_MIN_REDUCTION_RATIO` | `0.25` | Minimum Jev reduction required to accept and commit a pass; smaller passes are discarded, matching upstream semantics |
 | `PI_JEV_KEEP_THRESHOLD` | `0.5` | Jev keep-probability threshold |
 | `PI_JEV_PRESERVE_RECENT_MESSAGES` | `6` | Newest messages in the **logical** transcript protected from pruning |
 | `PI_JEV_MAX_STATE_TOKENS` | `25000` | Jev state budget |
@@ -100,7 +111,6 @@ export PI_JEV_DIAGNOSTICS=1
 | `PI_JEV_RETRY_DELAY_MS` | `30000` | Retry backoff after an evaluation failure |
 | `PI_JEV_CIRCUIT_BREAKER_FAILURES` | `2` | Consecutive failures before temporary bypass |
 | `PI_JEV_CIRCUIT_BREAKER_MS` | `120000` | Circuit-breaker duration |
-| `PI_JEV_SUCCESS_FRESH_MS` | `300000` | How recent a healthy Jev pass must be before Pi threshold compaction may be cancelled |
 | `PI_JEV_DIAGNOSTICS` | `1` | Persist JSONL diagnostics |
 | `PI_JEV_DIAGNOSTICS_FILE` | `~/.pi/agent/logs/fast-jev-compaction.jsonl` | Override diagnostics path |
 | `PI_JEV_DIAGNOSTICS_STDERR` | `0` | Also print each diagnostic record to stderr |
@@ -148,7 +158,7 @@ turn_end
 
 ## Upstream semantics
 
-The vendored algorithm follows `fast-jev-compaction` 0.2.0:
+The vendored algorithm follows `fast-jev-compaction` 0.3.0:
 
 - `keepResult >= threshold` -> keep call + full result.
 - otherwise `keepCall >= threshold` -> keep call + truncated result.
