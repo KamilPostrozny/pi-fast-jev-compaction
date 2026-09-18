@@ -1130,28 +1130,33 @@ async function evaluateAtTurnEnd(
   const newEligibleIds = newEligibleToolIds(eligibleNow, state.lastEvaluatedEligibleIds);
   const newEligibleResultTokens = toolResultTokenVolume(projection.messages, newEligibleIds);
 
-  const usage = ctx.getContextUsage();
-  const contextWindow = usage?.contextWindow ?? ctx.model?.contextWindow;
   const logicalTokens = rawTokenEstimate(projection.messages, ctx);
-  const logicalPercent =
-    contextWindow && contextWindow > 0 ? (logicalTokens / contextWindow) * 100 : null;
-  const effectivePercent = usage?.percent ?? logicalPercent;
+  const pressure = pressureSnapshot(logicalTokens, ctx, state);
+  const contextWindow = pressure.contextWindow;
+  const logicalPercent = pressure.logicalPercent ?? null;
+  const pressurePercent = pressure.pressurePercent;
   const policy = evaluationPolicy(config);
-  const requiredResultTokens = requiredNewResultTokens(effectivePercent, policy);
+  const requiredResultTokens = requiredNewResultTokens(
+    pressurePercent,
+    contextWindow,
+    policy,
+  );
 
-  state.lastPiTokens = usage?.tokens ?? undefined;
-  state.lastPiPercent = effectivePercent ?? undefined;
+  state.lastPiTokens = pressure.providerTokens;
+  state.lastPiPercent = pressure.providerPercent;
   state.lastContextWindow = contextWindow;
   state.lastLogicalTokens = logicalTokens;
-  state.lastLogicalPercent = logicalPercent ?? undefined;
+  state.lastLogicalPercent = pressure.logicalPercent;
+  state.lastPressurePercent = pressurePercent ?? undefined;
   state.lastLogicalToolCalls = calls.length;
   state.lastNewEligibleResultTokens = newEligibleResultTokens;
   state.lastRequiredNewResultTokens = requiredResultTokens;
-  state.active = effectivePercent !== null && effectivePercent >= config.compactAtPercent;
+  state.active = pressurePercent !== null && pressurePercent >= config.compactAtPercent;
 
   const forceRefresh = state.forceRefresh;
   const shouldEvaluate = shouldEvaluateAtTurnEnd({
-    effectivePercent,
+    pressurePercent,
+    contextWindow,
     forceRefresh,
     eligibleCalls: eligibleNow.size,
     previouslyEvaluatedCalls: previouslyEvaluatedNow.size,
@@ -1162,7 +1167,9 @@ async function evaluateAtTurnEnd(
 
   diagnostics.record("turn_evaluation_check", {
     turnIndex,
-    effectivePercent: effectivePercent === null ? null : Number(effectivePercent.toFixed(2)),
+    pressurePercent: pressurePercent === null ? null : Number(pressurePercent.toFixed(2)),
+    piPercent:
+      pressure.providerPercent === undefined ? null : Number(pressure.providerPercent.toFixed(2)),
     logicalPercent: logicalPercent === null ? null : Number(logicalPercent.toFixed(2)),
     triggerPercent: config.compactAtPercent,
     midPercent: config.reevaluateMidPercent,
