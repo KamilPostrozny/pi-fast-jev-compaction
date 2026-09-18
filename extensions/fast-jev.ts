@@ -1065,7 +1065,6 @@ async function evaluateAtTurnEnd(
     rawMessages,
     state.decisions,
     decisionIds(state.decisions),
-    config.truncateHeadChars,
   ).messages;
   const projection = projectMessages(logicalBefore);
   const calls = collectToolCalls(
@@ -1188,7 +1187,6 @@ async function evaluateAtTurnEnd(
     const effectiveRatio = activeReductionRatio(
       logicalBefore,
       activeMaps.committed,
-      config.truncateHeadChars,
     );
     const accepted = acceptsReduction(effectiveRatio, config.minReductionRatio);
     const beforeMerge = new Map(state.decisions);
@@ -1226,7 +1224,6 @@ async function evaluateAtTurnEnd(
         rawMessages,
         state.decisions,
         decisionIds(state.decisions),
-        config.truncateHeadChars,
       );
       const postProjection = projectMessages(applied.messages);
       const postTokens = rawTokenEstimate(postProjection.messages, ctx);
@@ -1361,7 +1358,6 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
         event.messages,
         state.decisions,
         decisionIds(state.decisions),
-        config.truncateHeadChars,
       );
       const logicalMessages = applied.messages;
       const grossProjection = projectMessages(event.messages);
@@ -1454,7 +1450,6 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
       const logical = logicalContextAtCompaction(
         ctx,
         state,
-        config.truncateHeadChars,
       );
 
       if (
@@ -1490,7 +1485,6 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
           event.preparation as typeof event.preparation & { fileOps: LocalFileOps },
           event.branchEntries,
           state.decisions,
-          config.truncateHeadChars,
         );
         diagnostics.record("native_compaction_sanitized", {
           reason: event.reason,
@@ -1594,7 +1588,7 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
       ? `${formatTokens(state.lastPiTokens)}${rawWindow} (${(state.lastPiPercent ?? 0).toFixed(1)}%)`
       : `unknown${rawWindow}`;
     const lastApply = state.lastApply
-      ? `dropped calls=${state.lastApply.droppedCalls}, dropped results=${state.lastApply.droppedResults}, truncated results=${state.lastApply.truncatedResults}`
+      ? `dropped calls=${state.lastApply.droppedCalls}, dropped results=${state.lastApply.droppedResults}, pruned results=${state.lastApply.prunedResults}`
       : "n/a";
     const committedDropCalls = [...state.decisions.values()].filter((decision) => decision.action === "drop_call").length;
     const committedDropResults = [...state.decisions.values()].filter((decision) => decision.action === "drop_result").length;
@@ -1727,7 +1721,6 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
       rawMessages,
       before,
       decisionIds(before),
-      config.truncateHeadChars,
     ).messages;
     const beforeTokens = rawTokenEstimate(projectMessages(beforeMessages).messages, ctx);
     let promoted = 0;
@@ -1748,7 +1741,6 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
         rawMessages,
         state.decisions,
         decisionIds(state.decisions),
-        config.truncateHeadChars,
       ).messages;
       const afterTokens = rawTokenEstimate(projectMessages(afterMessages).messages, ctx);
       state.pendingReductionTokens += Math.max(0, beforeTokens - afterTokens);
