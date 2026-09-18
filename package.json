@@ -1,7 +1,7 @@
 {
   "name": "pi-fast-jev-compaction",
-  "version": "0.6.3",
-  "description": "Restored 0.5 Jev scheduling behavior for Pi with explicit result pruning and calibrated native fallback.",
+  "version": "0.6.4",
+  "description": "Restored 0.5 Jev scheduling with resilient logical-history native fallback.",
   "type": "module",
   "license": "MIT",
   "keywords": [

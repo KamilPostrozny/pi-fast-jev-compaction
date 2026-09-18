@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
   acceptsReduction,
   activeRunAction,
+  canGuardNativeThreshold,
   requiredNewResultTokens,
   shouldDelayNativeThreshold,
   shouldEvaluateAtTurnEnd,
@@ -145,7 +146,55 @@ test("forced refresh bypasses pressure and volume gates but still needs eligible
   );
 });
 
-test("native threshold is delayed to the fallback boundary only while Jev is healthy", () => {
+test("committed logical history keeps guarding native fallback through remote failures", () => {
+  assert.equal(
+    canGuardNativeThreshold({
+      enabled: true,
+      hasKey: true,
+      remoteHealthy: false,
+      committedDecisions: 12,
+    }),
+    true,
+  );
+  assert.equal(
+    canGuardNativeThreshold({
+      enabled: true,
+      hasKey: true,
+      remoteHealthy: true,
+      committedDecisions: 0,
+    }),
+    true,
+  );
+  assert.equal(
+    canGuardNativeThreshold({
+      enabled: true,
+      hasKey: true,
+      remoteHealthy: false,
+      committedDecisions: 0,
+    }),
+    false,
+  );
+  assert.equal(
+    canGuardNativeThreshold({
+      enabled: false,
+      hasKey: true,
+      remoteHealthy: true,
+      committedDecisions: 12,
+    }),
+    false,
+  );
+  assert.equal(
+    canGuardNativeThreshold({
+      enabled: true,
+      hasKey: false,
+      remoteHealthy: true,
+      committedDecisions: 12,
+    }),
+    false,
+  );
+});
+
+test("native threshold delay depends on logical guard and fallback boundary", () => {
   assert.equal(shouldDelayNativeThreshold(87.4, 87.5, true), true);
   assert.equal(shouldDelayNativeThreshold(87.5, 87.5, true), false);
   assert.equal(shouldDelayNativeThreshold(76, 87.5, false), false);
