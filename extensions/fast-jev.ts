@@ -1071,11 +1071,12 @@ function logicalContextAtCompaction(
   state: RuntimeState,
 ): { tokens: number; messages: number; percent: number | null } {
   const raw = ctx.sessionManager.buildSessionContext().messages;
-  const logical = applyDecisionsDetailed(
+  const applied = applyDecisionsDetailed(
     raw,
     state.decisions,
     decisionIds(state.decisions),
-  ).messages;
+  );
+  const logical = appendGroundingReminder(applied.messages, applied.stats);
   const projection = projectMessages(logical);
   const tokens = rawTokenEstimate(projection.messages, ctx);
   return {
