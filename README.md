@@ -4,6 +4,20 @@ A Pi package port of [`tamaratran/fast-jev-compaction`](https://github.com/tamar
 
 It uses TypeSafe Jev to decide, tool call by tool call, which old calls/results still need to remain in model context. User and assistant prose is not summarized or rewritten by this extension. Pi's persisted session transcript stays intact.
 
+## 0.6.2: enforce source-read pins
+
+0.6.2 fixes a protection-plumbing bug in 0.6.1.
+
+0.6.1 correctly identified the newest successful `read` for each file/range as protected for local eligibility accounting, but the actual `compactMessages()` call still received the older projection protection set. As a result, diagnostics could report `protectedReadEvidence > 0` while Jev still scored and pruned those exact reads.
+
+0.6.2 builds one `evaluationProjection` whose protected IDs include the source-evidence pins, and uses that same projection for:
+
+- `collectToolCalls()` / eligibility accounting;
+- the Jev `compactMessages()` evaluation;
+- persisted decision mapping.
+
+That makes the invariant real: a read reported as protected cannot become a new `drop_result` decision in that pass.
+
 ## 0.6.1: stop source-grounding thrash
 
 0.6.1 fixes a regression introduced by the recurring grounding safeguard in 0.6.0.
