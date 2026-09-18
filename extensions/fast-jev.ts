@@ -1175,6 +1175,13 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
             accepted,
           });
         } catch (error) {
+          // A failed pass did not consume this settled generation. Keep it
+          // eligible for retry after backoff instead of waiting for another
+          // complete agent turn.
+          state.lastEvaluatedSettledGeneration = Math.min(
+            state.lastEvaluatedSettledGeneration,
+            state.settledGeneration - 1,
+          );
           failOpen(ctx, diagnostics, state, error, hookId, config.retryDelayMs);
           if (state.consecutiveFailures >= config.circuitBreakerFailures) {
             state.breakerUntilMs = Date.now() + config.circuitBreakerMs;
