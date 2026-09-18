@@ -1697,6 +1697,13 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
     const rawMessages = ctx.sessionManager.buildSessionContext().messages;
     const rawIds = rawToolCallIds(rawMessages);
     const before = new Map(state.decisions);
+    const beforeMessages = applyDecisionsDetailed(
+      rawMessages,
+      before,
+      decisionIds(before),
+      config.truncateHeadChars,
+    ).messages;
+    const beforeTokens = rawTokenEstimate(projectMessages(beforeMessages).messages, ctx);
     let promoted = 0;
 
     for (const [id, deferred] of state.deferredDropCalls) {
@@ -1711,6 +1718,18 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
     state.deferredDropCalls.clear();
 
     if (promoted > 0) {
+      const afterMessages = applyDecisionsDetailed(
+        rawMessages,
+        state.decisions,
+        decisionIds(state.decisions),
+        config.truncateHeadChars,
+      ).messages;
+      const afterTokens = rawTokenEstimate(projectMessages(afterMessages).messages, ctx);
+      state.pendingReductionTokens += Math.max(0, beforeTokens - afterTokens);
+      state.lastLogicalTokens = afterTokens;
+      const contextWindow = ctx.getContextUsage()?.contextWindow ?? ctx.model?.contextWindow;
+      state.lastLogicalPercent =
+        contextWindow && contextWindow > 0 ? (afterTokens / contextWindow) * 100 : undefined;
       persistLogicalState(pi, diagnostics, state, "agent_end_promote_drop_calls");
       state.lastEvaluationMode = "agent_end_promote";
     }
