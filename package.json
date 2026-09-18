@@ -1,7 +1,7 @@
 {
   "name": "pi-fast-jev-compaction",
-  "version": "0.6.1",
-  "description": "Calibrated Jev pruning for Pi with protected source-read evidence and native fallback.",
+  "version": "0.6.2",
+  "description": "Calibrated Jev pruning for Pi with enforced source-read evidence pins and native fallback.",
   "type": "module",
   "license": "MIT",
   "keywords": [

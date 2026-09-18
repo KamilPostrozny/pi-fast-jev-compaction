@@ -72,11 +72,20 @@ test("context hook never injects a recurring grounding user message", () => {
   assert.doesNotMatch(source, /GROUNDING_REMINDER/);
 });
 
-test("latest successful read evidence is protected from active Jev pruning", () => {
+test("latest successful read evidence uses the same pins for eligibility and Jev", () => {
+  const evaluateBlock = blockBetween(
+    "async function evaluateAtTurnEnd",
+    "export default function fastJevCompaction",
+  );
   assert.match(source, /function latestReadEvidenceIds/);
   assert.match(source, /block\.name !== "read"/);
-  assert.match(source, /sourceEvidenceIds = latestReadEvidenceIds\(logicalBefore\)/);
-  assert.match(source, /\.\.\.sourceEvidenceIds/);
+  assert.match(evaluateBlock, /sourceEvidenceIds = latestReadEvidenceIds\(logicalBefore\)/);
+  assert.match(evaluateBlock, /protectedToolCallIds:\s*protectedIds/);
+  assert.match(
+    evaluateBlock,
+    /collectToolCalls\([\s\S]*evaluationProjection\.protectedToolCallIds/,
+  );
+  assert.match(evaluateBlock, /evaluate\(\s*evaluationProjection,/);
 });
 
 test("turn-end scheduling and native fallback share calibrated pressure", () => {
