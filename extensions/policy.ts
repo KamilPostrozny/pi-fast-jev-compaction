@@ -75,17 +75,33 @@ export function shouldEvaluateAtTurnEnd(args: {
   return newEligibleResultTokens >= required;
 }
 
+export function canGuardNativeThreshold(args: {
+  enabled: boolean;
+  hasKey: boolean;
+  remoteHealthy: boolean;
+  committedDecisions: number;
+}): boolean {
+  const { enabled, hasKey, remoteHealthy, committedDecisions } = args;
+  if (!enabled || !hasKey) return false;
+
+  // A failed refresh must not invalidate already-committed logical pruning.
+  // Once we have a logical history to apply, remote timeout/backoff/breaker
+  // state is irrelevant to whether that history is safe to keep using.
+  return committedDecisions > 0 || remoteHealthy;
+}
+
 /**
  * Pi may request its built-in threshold compaction earlier than Jev. Delay that
- * request until our later native-fallback boundary, but only while Jev is
- * available. A broken/missing Jev must never disable Pi's safety net.
+ * request until our later native-fallback boundary whenever the extension can
+ * still provide a valid logical history. Remote Jev availability matters only
+ * before any logical decisions have been committed.
  */
 export function shouldDelayNativeThreshold(
   logicalPercent: number | null,
   fallbackPercent: number,
-  jevHealthy: boolean,
+  logicalGuardAvailable: boolean,
 ): boolean {
-  return jevHealthy &&
+  return logicalGuardAvailable &&
     logicalPercent !== null &&
     Number.isFinite(logicalPercent) &&
     logicalPercent < fallbackPercent;
