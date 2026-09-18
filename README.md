@@ -4,16 +4,27 @@ A Pi package port of [`tamaratran/fast-jev-compaction`](https://github.com/tamar
 
 It uses TypeSafe Jev to decide, tool call by tool call, which old calls/results still need to remain in model context. User and assistant prose is not summarized or rewritten by this extension. Pi's persisted session transcript stays intact.
 
-## 0.3.1: upstream-semantic fixes
+## 0.4.0: turn-end result-only compaction
 
-0.3.1 closes the remaining correctness gaps between the Pi adapter and the upstream Claude plugin:
+0.4.0 changes the Pi lifecycle to protect active coding work on small local context windows.
 
-- Jev passes below `PI_JEV_MIN_REDUCTION_RATIO` are now rejected without committing or persisting their proposed deletions.
-- Newly eligible tools no longer cause a fresh Jev request on every pre-LLM `context` hook. Above the trigger threshold, they are refreshed at most once per completed/settled agent generation.
-- Native Pi compaction is sanitized before Pi's built-in summarizer runs, so previously dropped calls/results cannot be reintroduced through the generated summary or file-operation metadata.
-- Jev decisions are retained across native compaction until the next context hook reconciles them against Pi's retained raw tail, preventing dropped calls in that tail from reappearing.
-- Pi threshold compaction is cancelled only when the current **logical** context is actually within Pi's native `contextWindow - reserveTokens` limit.
-- Image-bearing tool calls remain represented in Jev's history as pinned calls with a protected placeholder result instead of disappearing from Jev's causal state.
+- Jev HTTP evaluation runs only from Pi's `turn_end` event, after an assistant response and all of that turn's tool results are complete. The pre-LLM `context` hook is apply-only and never calls Jev.
+- The default Jev trigger is **80%**.
+- During an active autonomous agent run, Jev may keep a call or truncate its result, but it may not remove the call itself. Upstream `drop_call` decisions are downgraded to `drop_result` so file paths, commands, and other causal breadcrumbs remain visible.
+- Those deferred `drop_call` decisions are promoted only after a clean `agent_end`, when the autonomous task has finished.
+- Pi's earlier native threshold requests are intercepted while Jev is healthy. The default native fallback boundary is **87.5%** of the logical context, configurable with `PI_JEV_NATIVE_FALLBACK_PERCENT`.
+- If Jev is missing, failing, or its circuit breaker is open, the extension does not delay Pi native compaction.
+- Native compaction sanitization no longer imports Pi-internal file-operation helpers. It uses local reconstruction and fails open to Pi native compaction on any integration error.
+- Fresh Jev reductions are subtracted from Pi's stale pre-pruning usage estimate until the next provider response, preventing an immediate unnecessary native compaction.
+
+For a 65,536-token model the intended flow is therefore approximately:
+
+```text
+0–80%       normal agent work
+80–87.5%    Jev result-only pruning at completed turns
+>=87.5%     Pi native compaction fallback if logical context is still large
+overflow    Pi overflow recovery remains the final safety net
+```
 
 ## 0.3.0: monotonic logical history
 
@@ -51,9 +62,11 @@ This preserves upstream `drop_call` semantics. 0.3.0 does **not** change Jev's d
 
 ### Native Pi compaction boundary
 
-Pi still persists the original transcript, but native compaction now respects the logical Jev history. Before Pi's built-in summarizer runs, the extension applies all committed Jev decisions to `messagesToSummarize` and `turnPrefixMessages`, then rebuilds file-operation metadata from those sanitized messages.
+Pi still persists the original transcript, but native compaction respects the logical Jev history. If Pi asks for threshold compaction before the configured native fallback percentage, the extension cancels that request only while Jev is healthy. Once the logical context reaches the fallback boundary, or if Jev is unavailable, Pi native compaction proceeds.
 
-Pi may keep a raw recent tail after compaction. Destructive Jev decisions therefore remain active across the compaction event and are reconciled on the next `context` hook: IDs that were summarized disappear from the decision map, while IDs still present in the retained tail continue to be pruned. This prevents native compaction from resurrecting previously deleted tool context.
+Before native summarization proceeds, committed Jev decisions are applied to `messagesToSummarize` and `turnPrefixMessages`. File-operation metadata is rebuilt locally from the sanitized messages plus the previous native compaction metadata, so removed calls cannot leak stale paths back into the summary.
+
+Pi may keep a raw recent tail after compaction. Jev decisions remain active until the next `context` hook reconciles them against that retained tail.
 
 ## Diagnostics and freeze protection
 
@@ -86,7 +99,8 @@ export TYPESAFE_API_KEY="..."
 ## Recommended starting configuration
 
 ```bash
-export PI_JEV_COMPACT_AT_PERCENT=60
+export PI_JEV_COMPACT_AT_PERCENT=80
+export PI_JEV_NATIVE_FALLBACK_PERCENT=87.5
 export PI_JEV_REQUEST_TIMEOUT_MS=8000
 export PI_JEV_EVALUATION_TIMEOUT_MS=12000
 export PI_JEV_DIAGNOSTICS=1
@@ -96,7 +110,8 @@ export PI_JEV_DIAGNOSTICS=1
 
 | Variable | Default | Meaning |
 | --- | ---: | --- |
-| `PI_JEV_COMPACT_AT_PERCENT` | `60` | Run Jev when Pi's effective context usage reaches this percentage; committed pruning keeps applying below it |
+| `PI_JEV_COMPACT_AT_PERCENT` | `80` | Evaluate Jev at `turn_end` when effective context reaches this percentage; committed pruning keeps applying below it |
+| `PI_JEV_NATIVE_FALLBACK_PERCENT` | `87.5` | Delay Pi threshold compaction to this logical-context percentage while Jev is healthy; overflow recovery is unaffected |
 | `PI_JEV_MIN_REDUCTION_RATIO` | `0.25` | Minimum Jev reduction required to accept and commit a pass; smaller passes are discarded, matching upstream semantics |
 | `PI_JEV_KEEP_THRESHOLD` | `0.5` | Jev keep-probability threshold |
 | `PI_JEV_PRESERVE_RECENT_MESSAGES` | `6` | Newest messages in the **logical** transcript protected from pruning |
@@ -121,8 +136,8 @@ export PI_JEV_DIAGNOSTICS=1
 - `/jev-stats` — alias for `/jev-status`.
 - `/jev-diagnostics [N]` — show recent diagnostic events and the log path.
 - `/jev-diagnostics-clear` — clear diagnostics.
-- `/jev-refresh` — force a new Jev pass on the next model call, **using the already-compacted logical history**.
-- `/jev-on` — enable and force a Jev pass on the next model call.
+- `/jev-refresh` — force a new Jev pass at the next completed turn, using the already-compacted logical history.
+- `/jev-on` — enable and force a Jev pass at the next completed turn.
 - `/jev-off` — disable the context filter for this process/session. This intentionally exposes Pi's unfiltered persisted transcript while disabled.
 
 ## Interpreting `/jev-status`
@@ -130,31 +145,31 @@ export PI_JEV_DIAGNOSTICS=1
 Example fields:
 
 ```text
-context: Pi≈39.8k / 65.5k (60.7%) · Jev trigger=60%
-logical history≈24.1k / 65.5k (36.8%) · calls=11; this is what the model and next Jev pass see
-persisted Pi transcript≈73.0k / 65.5k (111.4%) · calls=31; diagnostic only
-committed decisions: 20 total · drop_call=15 · drop_result=3 · keep=2 · restored=0
+context: Pi≈52.8k / 65.5k (80.6%) · Jev trigger=80% · native fallback=87.5%
+logical history≈41.2k / 65.5k (62.9%) · calls=18; this is what the model and next Jev pass see
+persisted Pi transcript≈56.0k / 65.5k (85.4%) · calls=31; diagnostic only
+committed decisions: 20 total · drop_call=0 · drop_result=18 · keep=2 · deferred drop_call=11 · restored=0
 ```
 
 The persisted-transcript estimate may exceed 100%. That is expected because Pi still stores messages that the logical context has permanently filtered out.
 
 ## Diagnostic sequence
 
-A healthy evaluation typically looks like:
+A healthy active-run evaluation typically looks like:
 
 ```text
-context_enter
-  -> evaluation_start
+provider_response
+turn_end
+  -> turn_evaluation_check
+  -> evaluation_start mode=active_result_only
      -> http_start -> http_end
   -> logical_state_persisted
   -> evaluation_success
 context_apply
 provider_request_start
-provider_response
-turn_end
 ```
 
-`context_enter` now records both gross and logical message/tool/token counts. On a later Jev pass, previously committed `drop_call` entries must be absent from `logicalCalls` and from the Jev state.
+At a clean `agent_end`, deferred full deletions may be promoted without another Jev HTTP request. During the active run, `context_apply` must show `drop_call=0` for newly scored calls; old completed-task decisions may still contain committed `drop_call` entries.
 
 ## Upstream semantics
 
@@ -164,4 +179,4 @@ The vendored algorithm follows `fast-jev-compaction` 0.3.0:
 - otherwise `keepCall >= threshold` -> keep call + truncated result.
 - otherwise -> remove call + result.
 
-Only the Pi adapter/state-management layer differs. See `THIRD_PARTY_LICENSES.md` for the MIT license notice.
+The vendored scoring algorithm is unchanged. The Pi adapter intentionally constrains upstream `drop_call` to `drop_result` during an active agent run and defers the full deletion until clean `agent_end`. See `THIRD_PARTY_LICENSES.md` for the MIT license notice.

@@ -1,10 +1,7 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import {
-  buildSessionContext,
-  createFileOps,
-  extractFileOpsFromMessage,
-  type ExtensionAPI,
-  type ExtensionContext,
+import type {
+  ExtensionAPI,
+  ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import {
   collectToolCalls,
@@ -19,8 +16,9 @@ import {
 import { Diagnostics, summarizeDiagnostic } from "./diagnostics.ts";
 import {
   acceptsReduction,
-  hasNativeHeadroom,
-  shouldRefreshSettledEligible,
+  activeRunAction,
+  shouldDelayNativeThreshold,
+  shouldEvaluateAtTurnEnd,
 } from "./policy.ts";
 
 const STATUS_KEY = "fast-jev";
@@ -29,6 +27,7 @@ const STATE_SCHEMA_VERSION = 1;
 
 export interface Config {
   compactAtPercent: number;
+  nativeFallbackPercent: number;
   minReductionRatio: number;
   keepThreshold: number;
   preserveRecentMessages: number;
@@ -49,7 +48,8 @@ export interface Config {
 }
 
 const DEFAULTS: Config = {
-  compactAtPercent: 60,
+  compactAtPercent: 80,
+  nativeFallbackPercent: 87.5,
   minReductionRatio: 0.25,
   keepThreshold: 0.5,
   preserveRecentMessages: 6,
@@ -136,7 +136,6 @@ interface RuntimeState {
   retryAfterMs: number;
   consecutiveFailures: number;
   breakerUntilMs: number;
-  lastSuccessMs: number;
   lastEvaluationMs?: number;
   lastHttp?: HttpSnapshot;
   lastApply?: ApplyStats;
@@ -158,8 +157,10 @@ interface RuntimeState {
   lastProviderRequestMs?: number;
   lastProviderDurationMs?: number;
   lastProviderStatus?: number;
-  settledGeneration: number;
-  lastEvaluatedSettledGeneration: number;
+  deferredDropCalls: Map<string, CachedDecision>;
+  lastEvaluationMode?: "active_result_only";
+  lastEffectiveReduction?: number;
+  pendingReductionTokens: number;
 }
 
 function envNumber(name: string, fallback: number): number {
@@ -191,8 +192,13 @@ export function resolveConfig(): Config {
     requestTimeoutMs + 1_000,
     Math.floor(envNumber("PI_JEV_EVALUATION_TIMEOUT_MS", DEFAULTS.evaluationTimeoutMs)),
   );
+  const compactAtPercent = envNumber("PI_JEV_COMPACT_AT_PERCENT", DEFAULTS.compactAtPercent);
   const config: Config = {
-    compactAtPercent: envNumber("PI_JEV_COMPACT_AT_PERCENT", DEFAULTS.compactAtPercent),
+    compactAtPercent,
+    nativeFallbackPercent: Math.max(
+      compactAtPercent,
+      envNumber("PI_JEV_NATIVE_FALLBACK_PERCENT", DEFAULTS.nativeFallbackPercent),
+    ),
     minReductionRatio: envNumber("PI_JEV_MIN_REDUCTION_RATIO", DEFAULTS.minReductionRatio),
     keepThreshold: envNumber("PI_JEV_KEEP_THRESHOLD", DEFAULTS.keepThreshold),
     preserveRecentMessages: Math.max(
@@ -466,6 +472,56 @@ function decisionMap(result: CompactResult, calls: readonly JevToolCall[]): Map<
   return out;
 }
 
+function activeDecisionMaps(
+  result: CompactResult,
+  calls: readonly JevToolCall[],
+): {
+  committed: Map<string, CachedDecision>;
+  deferredDropCalls: Map<string, CachedDecision>;
+} {
+  const full = decisionMap(result, calls);
+  const committed = new Map<string, CachedDecision>();
+  const deferredDropCalls = new Map<string, CachedDecision>();
+  for (const [id, decision] of full) {
+    if (decision.action === "drop_call") deferredDropCalls.set(id, decision);
+    committed.set(id, { ...decision, action: activeRunAction(decision.action) });
+  }
+  return { committed, deferredDropCalls };
+}
+
+function projectedChars(messages: readonly JevMessage[]): number {
+  let total = 0;
+  for (const message of messages) {
+    total += message.text.length;
+    for (const tool of message.toolUses) {
+      try {
+        total += JSON.stringify(tool.input).length;
+      } catch {
+        total += 20;
+      }
+    }
+    for (const result of message.toolResults ?? []) total += result.text.length;
+  }
+  return total;
+}
+
+function activeReductionRatio(
+  messages: readonly AgentMessage[],
+  decisions: ReadonlyMap<string, CachedDecision>,
+  truncateHeadChars: number,
+): number {
+  const before = projectMessages(messages).messages;
+  const afterPi = applyDecisionsDetailed(
+    messages,
+    decisions,
+    decisionIds(decisions),
+    truncateHeadChars,
+  ).messages;
+  const after = projectMessages(afterPi).messages;
+  const charsBefore = projectedChars(before);
+  return charsBefore === 0 ? 0 : (charsBefore - projectedChars(after)) / charsBefore;
+}
+
 const ACTION_RANK: Record<CallAction, number> = { keep: 0, drop_result: 1, drop_call: 2 };
 
 /**
@@ -553,15 +609,18 @@ function restoreLogicalState(
   }
 
   state.decisions = restored;
+  state.deferredDropCalls.clear();
   state.restoredDecisionCount = restored.size;
   state.lastResult = undefined;
+  state.lastEffectiveReduction = undefined;
+  state.lastEvaluationMode = undefined;
+  state.pendingReductionTokens = 0;
   state.lastError = undefined;
   state.insufficient = false;
   state.forceRefresh = false;
   state.retryAfterMs = 0;
   state.consecutiveFailures = 0;
   state.breakerUntilMs = 0;
-  state.lastSuccessMs = 0;
   diagnostics.record("logical_state_restored", {
     decisions: restored.size,
     savedAt: saved?.savedAt,
@@ -770,8 +829,8 @@ function showEvaluationActivity(
 ): void {
   const reason = refreshReasons.includes("forced")
     ? "forced refresh"
-    : refreshReasons.includes("threshold_crossed")
-      ? "context threshold crossed"
+    : refreshReasons.includes("turn_end_threshold")
+      ? "completed turn reached threshold"
       : "newly eligible tools";
   ctx.ui.setStatus(STATUS_KEY, `Jev compacting… ${eligible} calls`);
   if (ctx.mode === "tui") {
@@ -799,12 +858,71 @@ function breakerActive(state: RuntimeState): boolean {
   return Date.now() < state.breakerUntilMs;
 }
 
+interface LocalFileOps {
+  read: Set<string>;
+  written: Set<string>;
+  edited: Set<string>;
+}
+
+function createLocalFileOps(): LocalFileOps {
+  return { read: new Set(), written: new Set(), edited: new Set() };
+}
+
+function extractLocalFileOps(message: AgentMessage, fileOps: LocalFileOps): void {
+  if (message.role !== "assistant" || !Array.isArray(message.content)) return;
+  for (const block of message.content) {
+    if (block.type !== "toolCall") continue;
+    const args = block.arguments as Record<string, unknown> | undefined;
+    const path = args && typeof args.path === "string" ? args.path : undefined;
+    if (!path) continue;
+    if (block.name === "read") fileOps.read.add(path);
+    else if (block.name === "write") fileOps.written.add(path);
+    else if (block.name === "edit") fileOps.edited.add(path);
+  }
+}
+
+function rebuildCompactionFileOps(
+  messages: readonly AgentMessage[],
+  branchEntries: readonly unknown[],
+): LocalFileOps {
+  const fileOps = createLocalFileOps();
+
+  // Preserve Pi's file metadata from the latest native compaction, then add
+  // only operations that survive Jev pruning. This avoids importing Pi
+  // internal helpers that are not part of the public extension API.
+  for (let i = branchEntries.length - 1; i >= 0; i--) {
+    const entry = branchEntries[i] as {
+      type?: string;
+      fromHook?: boolean;
+      details?: { readFiles?: unknown; modifiedFiles?: unknown };
+    };
+    if (entry.type !== "compaction") continue;
+    if (!entry.fromHook && entry.details) {
+      if (Array.isArray(entry.details.readFiles)) {
+        for (const path of entry.details.readFiles) {
+          if (typeof path === "string") fileOps.read.add(path);
+        }
+      }
+      if (Array.isArray(entry.details.modifiedFiles)) {
+        for (const path of entry.details.modifiedFiles) {
+          if (typeof path === "string") fileOps.edited.add(path);
+        }
+      }
+    }
+    break;
+  }
+
+  for (const message of messages) extractLocalFileOps(message, fileOps);
+  return fileOps;
+}
+
 function sanitizeCompactionPreparation(
   preparation: {
     messagesToSummarize: AgentMessage[];
     turnPrefixMessages: AgentMessage[];
-    fileOps: ReturnType<typeof createFileOps>;
+    fileOps: LocalFileOps;
   },
+  branchEntries: readonly unknown[],
   decisions: ReadonlyMap<string, CachedDecision>,
   truncateHeadChars: number,
 ): ApplyStats {
@@ -824,14 +942,10 @@ function sanitizeCompactionPreparation(
 
   preparation.messagesToSummarize = history.messages;
   preparation.turnPrefixMessages = prefix.messages;
-
-  // Pi appends file-operation metadata to its summary. Rebuild it from the
-  // sanitized messages so a dropped tool call cannot leak back via a filename.
-  const fileOps = createFileOps();
-  for (const message of [...history.messages, ...prefix.messages]) {
-    extractFileOpsFromMessage(message, fileOps);
-  }
-  preparation.fileOps = fileOps;
+  preparation.fileOps = rebuildCompactionFileOps(
+    [...history.messages, ...prefix.messages],
+    branchEntries,
+  );
 
   return {
     droppedCalls: history.stats.droppedCalls + prefix.stats.droppedCalls,
@@ -843,12 +957,11 @@ function sanitizeCompactionPreparation(
 }
 
 function logicalContextAtCompaction(
-  branchEntries: Parameters<typeof buildSessionContext>[0],
   ctx: ExtensionContext,
   state: RuntimeState,
   truncateHeadChars: number,
-): { tokens: number; messages: number } {
-  const raw = buildSessionContext(branchEntries).messages;
+): { tokens: number; messages: number; percent: number | null } {
+  const raw = ctx.sessionManager.buildSessionContext().messages;
   const logical = applyDecisionsDetailed(
     raw,
     state.decisions,
@@ -856,9 +969,30 @@ function logicalContextAtCompaction(
     truncateHeadChars,
   ).messages;
   const projection = projectMessages(logical);
+  const tokens = rawTokenEstimate(projection.messages, ctx);
+  const usage = ctx.getContextUsage();
+  const contextWindow = usage?.contextWindow ?? ctx.model?.contextWindow;
+  const estimatedPercent =
+    contextWindow && contextWindow > 0 ? (tokens / contextWindow) * 100 : null;
+  const adjustedUsagePercent =
+    usage?.tokens !== null &&
+    usage?.tokens !== undefined &&
+    contextWindow &&
+    contextWindow > 0
+      ? (Math.max(0, usage.tokens - state.pendingReductionTokens) / contextWindow) * 100
+      : usage?.percent ?? null;
+  // Calibrate the local estimate against Pi's provider-backed usage while
+  // subtracting only pruning committed after that usage measurement.
+  const percent =
+    adjustedUsagePercent === null || adjustedUsagePercent === undefined
+      ? estimatedPercent
+      : estimatedPercent === null
+        ? adjustedUsagePercent
+        : Math.max(adjustedUsagePercent, estimatedPercent);
   return {
-    tokens: rawTokenEstimate(projection.messages, ctx),
+    tokens,
     messages: logical.length,
+    percent,
   };
 }
 
@@ -888,6 +1022,237 @@ function failOpen(
   notify(ctx, `fast-jev-compaction: ${state.lastError}; keeping previously compacted logical history`, "warning");
 }
 
+async function evaluateAtTurnEnd(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  config: Config,
+  diagnostics: Diagnostics,
+  state: RuntimeState,
+  turnIndex: number,
+): Promise<void> {
+  if (!state.enabled) return;
+
+  const rawMessages = ctx.sessionManager.buildSessionContext().messages;
+  const rawIds = rawToolCallIds(rawMessages);
+
+  if ([...state.decisions.keys()].some((id) => !rawIds.has(id))) {
+    state.decisions = new Map([...state.decisions].filter(([id]) => rawIds.has(id)));
+  }
+  for (const id of [...state.deferredDropCalls.keys()]) {
+    if (!rawIds.has(id)) state.deferredDropCalls.delete(id);
+  }
+
+  const logicalBefore = applyDecisionsDetailed(
+    rawMessages,
+    state.decisions,
+    decisionIds(state.decisions),
+    config.truncateHeadChars,
+  ).messages;
+  const projection = projectMessages(logicalBefore);
+  const calls = collectToolCalls(
+    projection.messages,
+    config.preserveRecentMessages,
+    projection.protectedToolCallIds,
+  );
+  const eligibleNow = eligibleToolIds(calls);
+  const unscored = hasUnscoredEligibleCall(calls, state);
+
+  const usage = ctx.getContextUsage();
+  const contextWindow = usage?.contextWindow ?? ctx.model?.contextWindow;
+  const logicalTokens = rawTokenEstimate(projection.messages, ctx);
+  const logicalPercent =
+    contextWindow && contextWindow > 0 ? (logicalTokens / contextWindow) * 100 : null;
+  const effectivePercent = usage?.percent ?? logicalPercent;
+
+  state.lastPiTokens = usage?.tokens ?? undefined;
+  state.lastPiPercent = effectivePercent ?? undefined;
+  state.lastContextWindow = contextWindow;
+  state.lastLogicalTokens = logicalTokens;
+  state.lastLogicalPercent = logicalPercent ?? undefined;
+  state.lastLogicalToolCalls = calls.length;
+  state.active = effectivePercent !== null && effectivePercent >= config.compactAtPercent;
+
+  const forceRefresh = state.forceRefresh;
+  const shouldEvaluate = shouldEvaluateAtTurnEnd(
+    effectivePercent,
+    config.compactAtPercent,
+    forceRefresh,
+    forceRefresh ? eligibleNow.size > 0 : unscored,
+  );
+
+  diagnostics.record("turn_evaluation_check", {
+    turnIndex,
+    effectivePercent: effectivePercent === null ? null : Number(effectivePercent.toFixed(2)),
+    logicalPercent: logicalPercent === null ? null : Number(logicalPercent.toFixed(2)),
+    triggerPercent: config.compactAtPercent,
+    eligible: eligibleNow.size,
+    unscored,
+    forced: forceRefresh,
+    shouldEvaluate,
+    committed: state.decisions.size,
+    deferredDropCalls: state.deferredDropCalls.size,
+  });
+
+  if (!shouldEvaluate) {
+    updateStatus(ctx, state);
+    return;
+  }
+  if (state.evaluating) {
+    diagnostics.record("evaluation_skipped", { turnIndex, reason: "already_evaluating" });
+    return;
+  }
+  if (Date.now() < state.retryAfterMs) {
+    diagnostics.record("evaluation_skipped", {
+      turnIndex,
+      reason: "retry_backoff",
+      retryRemainingMs: state.retryAfterMs - Date.now(),
+    });
+    return;
+  }
+  if (breakerActive(state)) {
+    diagnostics.record("evaluation_skipped", {
+      turnIndex,
+      reason: "circuit_breaker",
+      breakerRemainingMs: state.breakerUntilMs - Date.now(),
+    });
+    return;
+  }
+
+  const key = process.env.TYPESAFE_API_KEY?.trim();
+  if (!key) {
+    state.lastError = "TYPESAFE_API_KEY is not configured";
+    state.insufficient = true;
+    if (!state.notifiedMissingKey) {
+      notify(ctx, "fast-jev-compaction: TYPESAFE_API_KEY is not configured; Pi native compaction remains enabled", "warning");
+      state.notifiedMissingKey = true;
+    }
+    diagnostics.record("evaluation_skipped", { turnIndex, reason: "missing_api_key" });
+    updateStatus(ctx, state);
+    return;
+  }
+
+  state.evaluating = true;
+  state.forceRefresh = false;
+  state.evaluationAttempts += 1;
+  state.lastEvaluationEligible = eligibleNow.size;
+  showEvaluationActivity(
+    ctx,
+    state,
+    eligibleNow.size,
+    logicalTokens,
+    effectivePercent,
+    forceRefresh ? ["forced"] : ["turn_end_threshold"],
+  );
+  diagnostics.record("evaluation_start", {
+    turnIndex,
+    mode: "active_result_only",
+    eligible: eligibleNow.size,
+    logicalCalls: calls.length,
+    committedBefore: state.decisions.size,
+    logicalTokens,
+    effectivePercent: effectivePercent === null ? null : Number(effectivePercent.toFixed(2)),
+    timeoutMs: config.evaluationTimeoutMs,
+  });
+
+  try {
+    const evaluation = await evaluate(
+      projection,
+      calls,
+      logicalTokens,
+      config,
+      logicalBefore,
+      diagnostics,
+      state,
+    );
+    const upstreamRatio = reductionRatio(evaluation.result);
+    const activeMaps = activeDecisionMaps(evaluation.result, evaluation.calls);
+    const effectiveRatio = activeReductionRatio(
+      logicalBefore,
+      activeMaps.committed,
+      config.truncateHeadChars,
+    );
+    const accepted = acceptsReduction(effectiveRatio, config.minReductionRatio);
+    const beforeMerge = new Map(state.decisions);
+
+    if (accepted) {
+      state.decisions = mergeMonotonicDecisions(beforeMerge, activeMaps.committed, rawIds);
+
+      // Only the latest accepted evaluation controls which full deletions are
+      // eligible for promotion at agent_end. Until then every such call remains
+      // as a breadcrumb with at most its result truncated.
+      for (const call of evaluation.calls) {
+        if (!call.pinned) state.deferredDropCalls.delete(call.tool_use_id);
+      }
+      for (const [id, decision] of activeMaps.deferredDropCalls) {
+        if (rawIds.has(id)) state.deferredDropCalls.set(id, decision);
+      }
+
+      persistLogicalState(pi, diagnostics, state, "turn_end_result_only");
+    }
+
+    state.lastResult = evaluation.result;
+    state.lastEffectiveReduction = effectiveRatio;
+    state.lastEvaluationMode = "active_result_only";
+    state.lastError = undefined;
+    state.retryAfterMs = 0;
+    state.insufficient = !accepted;
+    state.consecutiveFailures = 0;
+    state.breakerUntilMs = 0;
+    state.lastEvaluationMs = evaluation.durationMs;
+    state.lastEvaluationRequests = evaluation.result.stats.requests;
+    state.evaluationSuccesses += 1;
+
+    if (accepted) {
+      const applied = applyDecisionsDetailed(
+        rawMessages,
+        state.decisions,
+        decisionIds(state.decisions),
+        config.truncateHeadChars,
+      );
+      const postProjection = projectMessages(applied.messages);
+      const postTokens = rawTokenEstimate(postProjection.messages, ctx);
+      state.pendingReductionTokens = Math.max(0, logicalTokens - postTokens);
+      state.lastLogicalTokens = postTokens;
+      state.lastLogicalPercent =
+        contextWindow && contextWindow > 0 ? (postTokens / contextWindow) * 100 : undefined;
+      state.lastApply = applied.stats;
+    }
+
+    const downgradedDropCalls = [...activeMaps.deferredDropCalls].length;
+    diagnostics.record("evaluation_success", {
+      turnIndex,
+      mode: "active_result_only",
+      durationMs: evaluation.durationMs,
+      upstreamReduction: Number(upstreamRatio.toFixed(4)),
+      effectiveReduction: Number(effectiveRatio.toFixed(4)),
+      requests: evaluation.result.stats.requests,
+      stateTokens: evaluation.result.stats.stateTokens,
+      stateStage: evaluation.result.stats.stateStage,
+      proposedDecisions: activeMaps.committed.size,
+      downgradedDropCalls,
+      committedBefore: beforeMerge.size,
+      committedAfter: state.decisions.size,
+      deferredDropCalls: state.deferredDropCalls.size,
+      actions: countActions(evaluation.result),
+      accepted,
+    });
+  } catch (error) {
+    failOpen(ctx, diagnostics, state, error, undefined, config.retryDelayMs);
+    if (state.consecutiveFailures >= config.circuitBreakerFailures) {
+      state.breakerUntilMs = Date.now() + config.circuitBreakerMs;
+      diagnostics.record("circuit_breaker_open", {
+        turnIndex,
+        failures: state.consecutiveFailures,
+        breakerMs: config.circuitBreakerMs,
+      });
+    }
+  } finally {
+    state.evaluating = false;
+    clearEvaluationActivity(ctx);
+    updateStatus(ctx, state);
+  }
+}
+
 export default function fastJevCompaction(pi: ExtensionAPI): void {
   const config = resolveConfig();
   const diagnostics = new Diagnostics({
@@ -906,7 +1271,6 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
     retryAfterMs: 0,
     consecutiveFailures: 0,
     breakerUntilMs: 0,
-    lastSuccessMs: 0,
     restoredDecisionCount: 0,
     contextHookCount: 0,
     failOpenCount: 0,
@@ -918,13 +1282,14 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
     totalHttpErrors: 0,
     totalHttpTimeouts: 0,
     providerRequestCount: 0,
-    settledGeneration: 0,
-    lastEvaluatedSettledGeneration: -1,
+    deferredDropCalls: new Map(),
+    pendingReductionTokens: 0,
   };
 
   diagnostics.record("extension_loaded", {
-    version: "0.3.1",
+    version: "0.4.0",
     compactAtPercent: config.compactAtPercent,
+    nativeFallbackPercent: config.nativeFallbackPercent,
     requestTimeoutMs: config.requestTimeoutMs,
     evaluationTimeoutMs: config.evaluationTimeoutMs,
     circuitBreakerFailures: config.circuitBreakerFailures,
@@ -944,17 +1309,13 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
     state.lastContextHookId = hookId;
     state.lastContextOutcome = "entered";
 
-    try {
-      if (!state.enabled) {
-        state.lastContextOutcome = "disabled";
-        diagnostics.record("context_bypass", { hookId, reason: "disabled" });
-        return;
-      }
+    if (!state.enabled) {
+      state.lastContextOutcome = "disabled";
+      diagnostics.record("context_bypass", { hookId, reason: "disabled" });
+      return;
+    }
 
-      // Pi keeps the full session transcript on disk. The logical transcript is
-      // reconstructed on every hook by applying all previously committed Jev
-      // decisions first. This is the key invariant: deleted calls/results never
-      // re-enter either the model context or a later Jev state.
+    try {
       const rawIds = rawToolCallIds(event.messages);
       if ([...state.decisions.keys()].some((id) => !rawIds.has(id))) {
         const before = state.decisions.size;
@@ -966,419 +1327,187 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
           removed: before - state.decisions.size,
         });
       }
-
-      const committedBeforePass = applyDecisionsDetailed(
-        event.messages,
-        state.decisions,
-        decisionIds(state.decisions),
-        config.truncateHeadChars,
-      );
-      const logicalMessagesBeforePass = committedBeforePass.messages;
-
-      const projectionStarted = Date.now();
-      const grossProjection = projectMessages(event.messages);
-      const projection = projectMessages(logicalMessagesBeforePass);
-      const calls = collectToolCalls(
-        projection.messages,
-        config.preserveRecentMessages,
-        projection.protectedToolCallIds,
-      );
-      const eligibleNow = eligibleToolIds(calls);
-      const projectionMs = Date.now() - projectionStarted;
-
-      const grossTokens = rawTokenEstimate(grossProjection.messages, ctx);
-      const logicalTokens = rawTokenEstimate(projection.messages, ctx);
-      state.lastRawTokens = grossTokens;
-      state.lastLogicalTokens = logicalTokens;
-      state.lastGrossToolCalls = rawIds.size;
-      state.lastLogicalToolCalls = calls.length;
-
-      const piUsage = ctx.getContextUsage();
-      const contextWindow = piUsage?.contextWindow ?? ctx.model?.contextWindow;
-      state.lastContextWindow = contextWindow;
-      const grossPercent = contextWindow && contextWindow > 0 ? (grossTokens / contextWindow) * 100 : 0;
-      const logicalPercent = contextWindow && contextWindow > 0 ? (logicalTokens / contextWindow) * 100 : 0;
-      state.lastRawPercent = grossPercent;
-      state.lastLogicalPercent = logicalPercent;
-      const piTokens = piUsage?.tokens ?? null;
-      const piPercent = piUsage?.percent ?? (
-        piTokens !== null && contextWindow && contextWindow > 0
-          ? (piTokens / contextWindow) * 100
-          : null
-      );
-      state.lastPiTokens = piTokens ?? undefined;
-      state.lastPiPercent = piPercent ?? undefined;
-
-      const wasAtThreshold = state.active;
-      state.active = piPercent !== null && piPercent >= config.compactAtPercent;
-      const refreshReasons: string[] = [];
-      if (state.forceRefresh) refreshReasons.push("forced");
-      if (state.active && !wasAtThreshold) refreshReasons.push("threshold_crossed");
-      if (
-        shouldRefreshSettledEligible(
-          state.active,
-          state.settledGeneration,
-          state.lastEvaluatedSettledGeneration,
-          hasUnscoredEligibleCall(calls, state),
-        )
-      ) {
-        refreshReasons.push("settled_unscored_eligible_call");
-      }
-      const refreshNeeded = refreshReasons.length > 0 && eligibleNow.size > 0;
-
-      diagnostics.record("context_enter", {
-        hookId,
-        rawMessages: event.messages.length,
-        logicalMessages: logicalMessagesBeforePass.length,
-        grossToolCalls: rawIds.size,
-        logicalCalls: calls.length,
-        eligible: eligibleNow.size,
-        committed: state.decisions.size,
-        permanentlyDroppedCalls: [...state.decisions.values()].filter((d) => d.action === "drop_call").length,
-        truncatedResults: [...state.decisions.values()].filter((d) => d.action === "drop_result").length,
-        protectedImages: projection.protectedToolCallIds.size,
-        grossTokens,
-        logicalTokens,
-        contextWindow,
-        grossPercent: Number(grossPercent.toFixed(2)),
-        logicalPercent: Number(logicalPercent.toFixed(2)),
-        piTokens,
-        piPercent: piPercent === null ? null : Number(piPercent.toFixed(2)),
-        compactAtPercent: config.compactAtPercent,
-        thresholdReached: state.active,
-        projectionMs,
-        refreshReasons,
-      });
-
-      if (breakerActive(state)) {
-        state.lastContextOutcome = state.decisions.size > 0 ? "circuit_breaker_cached" : "circuit_breaker";
-        diagnostics.record("context_bypass", {
-          hookId,
-          reason: "circuit_breaker",
-          breakerRemainingMs: state.breakerUntilMs - Date.now(),
-          committed: state.decisions.size,
-        });
-        updateStatus(ctx, state);
-        if (state.decisions.size > 0) return { messages: logicalMessagesBeforePass };
-        return;
-      }
-      if (state.breakerUntilMs > 0) {
-        diagnostics.record("circuit_breaker_reset", { hookId });
-        state.breakerUntilMs = 0;
-        state.consecutiveFailures = 0;
-        state.lastError = undefined;
+      for (const id of [...state.deferredDropCalls.keys()]) {
+        if (!rawIds.has(id)) state.deferredDropCalls.delete(id);
       }
 
-      const key = process.env.TYPESAFE_API_KEY?.trim();
-      if (!key && refreshNeeded) {
-        state.lastError = "TYPESAFE_API_KEY is not configured";
-        state.insufficient = true;
-        if (!state.notifiedMissingKey) {
-          notify(ctx, "fast-jev-compaction: TYPESAFE_API_KEY is not configured; keeping committed logical history", "warning");
-          state.notifiedMissingKey = true;
-        }
-        state.lastContextOutcome = state.decisions.size > 0 ? "missing_api_key_cached" : "missing_api_key";
-        diagnostics.record("context_exit", {
-          hookId,
-          outcome: state.lastContextOutcome,
-          durationMs: Date.now() - hookStarted,
-          committed: state.decisions.size,
-        });
-        updateStatus(ctx, state);
-        if (state.decisions.size > 0) return { messages: logicalMessagesBeforePass };
-        return;
-      }
-
-      const shouldEvaluate =
-        refreshNeeded &&
-        !state.evaluating &&
-        Date.now() >= state.retryAfterMs;
-
-      if (shouldEvaluate) {
-        state.evaluating = true;
-        state.forceRefresh = false;
-        state.lastEvaluatedSettledGeneration = state.settledGeneration;
-        state.evaluationAttempts += 1;
-        state.lastEvaluationEligible = eligibleNow.size;
-        showEvaluationActivity(ctx, state, eligibleNow.size, logicalTokens, piPercent, refreshReasons);
-        diagnostics.record("evaluation_start", {
-          hookId,
-          eligible: eligibleNow.size,
-          logicalCalls: calls.length,
-          committedBefore: state.decisions.size,
-          grossTokens,
-          logicalTokens,
-          piTokens,
-          piPercent: piPercent === null ? null : Number(piPercent.toFixed(2)),
-          refreshReasons,
-          timeoutMs: config.evaluationTimeoutMs,
-        });
-
-        try {
-          const evaluation = await evaluate(
-            projection,
-            calls,
-            logicalTokens,
-            config,
-            logicalMessagesBeforePass,
-            diagnostics,
-            state,
-          );
-          const ratio = reductionRatio(evaluation.result);
-          const proposed = decisionMap(evaluation.result, evaluation.calls);
-          const beforeMerge = new Map(state.decisions);
-          const accepted = acceptsReduction(ratio, config.minReductionRatio);
-          if (accepted) {
-            state.decisions = mergeMonotonicDecisions(beforeMerge, proposed, rawIds);
-            persistLogicalState(pi, diagnostics, state, "jev_pass");
-          }
-          state.lastResult = evaluation.result;
-          state.lastError = undefined;
-          state.retryAfterMs = 0;
-          state.insufficient = !accepted;
-          state.consecutiveFailures = 0;
-          state.breakerUntilMs = 0;
-          state.lastSuccessMs = accepted ? Date.now() : state.lastSuccessMs;
-          state.lastEvaluationMs = evaluation.durationMs;
-          state.lastEvaluationRequests = evaluation.result.stats.requests;
-          state.evaluationSuccesses += 1;
-
-          const committedAfter = state.decisions.size;
-          const newlyCommitted = accepted
-            ? [...state.decisions].filter(([id, decision]) => {
-                const previous = beforeMerge.get(id);
-                return !previous || ACTION_RANK[decision.action] > ACTION_RANK[previous.action];
-              }).length
-            : 0;
-          diagnostics.record("evaluation_success", {
-            hookId,
-            durationMs: evaluation.durationMs,
-            reduction: Number(ratio.toFixed(4)),
-            requests: evaluation.result.stats.requests,
-            totalHttpRequests: state.totalHttpRequests,
-            evaluationAttempts: state.evaluationAttempts,
-            evaluationSuccesses: state.evaluationSuccesses,
-            stateTokens: evaluation.result.stats.stateTokens,
-            stateStage: evaluation.result.stats.stateStage,
-            proposedDecisions: proposed.size,
-            committedBefore: beforeMerge.size,
-            committedAfter,
-            newlyCommitted,
-            actions: countActions(evaluation.result),
-            insufficient: state.insufficient,
-            accepted,
-          });
-        } catch (error) {
-          // A failed pass did not consume this settled generation. Keep it
-          // eligible for retry after backoff instead of waiting for another
-          // complete agent turn.
-          state.lastEvaluatedSettledGeneration = Math.min(
-            state.lastEvaluatedSettledGeneration,
-            state.settledGeneration - 1,
-          );
-          failOpen(ctx, diagnostics, state, error, hookId, config.retryDelayMs);
-          if (state.consecutiveFailures >= config.circuitBreakerFailures) {
-            state.breakerUntilMs = Date.now() + config.circuitBreakerMs;
-            diagnostics.record("circuit_breaker_open", {
-              hookId,
-              failures: state.consecutiveFailures,
-              breakerMs: config.circuitBreakerMs,
-            });
-          }
-          updateStatus(ctx, state);
-          state.lastContextOutcome = state.decisions.size > 0
-            ? "evaluation_failed_cached_history"
-            : "fail_open_after_evaluation";
-          diagnostics.record("context_exit", {
-            hookId,
-            outcome: state.lastContextOutcome,
-            durationMs: Date.now() - hookStarted,
-            committed: state.decisions.size,
-          });
-          if (state.decisions.size > 0) return { messages: logicalMessagesBeforePass };
-          return;
-        } finally {
-          state.evaluating = false;
-          clearEvaluationActivity(ctx);
-          updateStatus(ctx, state);
-        }
-      } else if (refreshNeeded) {
-        diagnostics.record("evaluation_skipped", {
-          hookId,
-          reason: state.evaluating
-            ? "already_evaluating"
-            : Date.now() < state.retryAfterMs
-              ? "retry_backoff"
-              : "unknown",
-          retryRemainingMs: Math.max(0, state.retryAfterMs - Date.now()),
-        });
-      }
-
-      updateStatus(ctx, state);
-      if (state.decisions.size === 0) {
-        state.lastContextOutcome = state.active ? "unchanged_no_decisions" : "inactive_no_decisions";
-        diagnostics.record("context_exit", {
-          hookId,
-          outcome: state.lastContextOutcome,
-          durationMs: Date.now() - hookStarted,
-          eligible: eligibleNow.size,
-          committed: 0,
-        });
-        return;
-      }
-
-      // Rebuild from the full persisted Pi transcript using the complete set of
-      // committed decisions, not just calls that are eligible in this pass.
-      // This makes drop_call/drop_result permanent in the logical history.
       const applied = applyDecisionsDetailed(
         event.messages,
         state.decisions,
         decisionIds(state.decisions),
         config.truncateHeadChars,
       );
-      const appliedProjection = projectMessages(applied.messages);
-      const appliedTokens = rawTokenEstimate(appliedProjection.messages, ctx);
-      state.lastLogicalTokens = appliedTokens;
-      state.lastLogicalPercent = contextWindow && contextWindow > 0
-        ? (appliedTokens / contextWindow) * 100
-        : undefined;
+      const logicalMessages = applied.messages;
+      const grossProjection = projectMessages(event.messages);
+      const logicalProjection = projectMessages(logicalMessages);
+      const logicalCalls = collectToolCalls(
+        logicalProjection.messages,
+        config.preserveRecentMessages,
+        logicalProjection.protectedToolCallIds,
+      );
+
+      const grossTokens = rawTokenEstimate(grossProjection.messages, ctx);
+      const logicalTokens = rawTokenEstimate(logicalProjection.messages, ctx);
+      const usage = ctx.getContextUsage();
+      const contextWindow = usage?.contextWindow ?? ctx.model?.contextWindow;
+      const grossPercent =
+        contextWindow && contextWindow > 0 ? (grossTokens / contextWindow) * 100 : undefined;
+      const logicalPercent =
+        contextWindow && contextWindow > 0 ? (logicalTokens / contextWindow) * 100 : undefined;
+      const effectivePercent = usage?.percent ?? logicalPercent ?? null;
+
+      state.lastRawTokens = grossTokens;
+      state.lastRawPercent = grossPercent;
+      state.lastLogicalTokens = logicalTokens;
+      state.lastLogicalPercent = logicalPercent;
+      state.lastPiTokens = usage?.tokens ?? undefined;
+      state.lastPiPercent = effectivePercent ?? undefined;
+      state.lastContextWindow = contextWindow;
+      state.lastGrossToolCalls = rawIds.size;
+      state.lastLogicalToolCalls = logicalCalls.length;
       state.lastApply = applied.stats;
-      state.lastContextOutcome = state.active ? "applied" : "applied_committed_below_threshold";
+      state.active =
+        effectivePercent !== null && effectivePercent >= config.compactAtPercent;
+
+      state.lastContextOutcome =
+        state.decisions.size > 0
+          ? state.active
+            ? "applied_committed_at_threshold"
+            : "applied_committed"
+          : state.active
+            ? "armed_no_decisions"
+            : "idle";
+
       diagnostics.record("context_apply", {
         hookId,
-        thresholdReached: state.active,
-        piPercent: piPercent === null ? null : Number(piPercent.toFixed(2)),
+        outcome: state.lastContextOutcome,
+        rawMessages: event.messages.length,
+        logicalMessages: logicalMessages.length,
+        grossToolCalls: rawIds.size,
+        logicalCalls: logicalCalls.length,
         committed: state.decisions.size,
-        logicalTokensBeforePass: logicalTokens,
-        logicalTokensAfterPass: appliedTokens,
+        deferredDropCalls: state.deferredDropCalls.size,
+        grossTokens,
+        logicalTokens,
+        contextWindow,
+        grossPercent: grossPercent === undefined ? null : Number(grossPercent.toFixed(2)),
+        logicalPercent: logicalPercent === undefined ? null : Number(logicalPercent.toFixed(2)),
+        piTokens: usage?.tokens ?? null,
+        piPercent: effectivePercent === null ? null : Number(effectivePercent.toFixed(2)),
+        compactAtPercent: config.compactAtPercent,
         ...applied.stats,
         durationMs: Date.now() - hookStarted,
       });
-      return { messages: applied.messages };
-    } catch (error) {
-      // Last-resort containment: preserve any already committed logical history.
-      // Only when no successful Jev decision exists do we fall all the way back
-      // to Pi's untouched transcript.
-      failOpen(ctx, diagnostics, state, error, hookId, config.retryDelayMs);
       updateStatus(ctx, state);
-      state.lastContextOutcome = state.decisions.size > 0
-        ? "outer_error_cached_history"
-        : "fail_open_outer_catch";
+
+      if (state.decisions.size > 0) return { messages: logicalMessages };
+      return;
+    } catch (error) {
+      failOpen(ctx, diagnostics, state, error, hookId, config.retryDelayMs);
+      state.lastContextOutcome = "context_apply_failed";
       diagnostics.record("context_exit", {
         hookId,
         outcome: state.lastContextOutcome,
         durationMs: Date.now() - hookStarted,
-        committed: state.decisions.size,
+        error: errorText(error),
       });
-      if (state.decisions.size > 0) {
-        try {
-          const cached = applyDecisionsDetailed(
-            event.messages,
-            state.decisions,
-            decisionIds(state.decisions),
-            config.truncateHeadChars,
-          );
-          return { messages: cached.messages };
-        } catch (applyError) {
-          diagnostics.record("cached_history_apply_failed", { hookId, error: errorText(applyError) });
-        }
-      }
+      updateStatus(ctx, state);
       return;
     }
   });
+
   pi.on("session_before_compact", (event, ctx) => {
-    let sanitized: ApplyStats | undefined;
-    if (state.enabled && state.decisions.size > 0) {
-      sanitized = sanitizeCompactionPreparation(
-        event.preparation,
-        state.decisions,
+    try {
+      const hasKey = Boolean(process.env.TYPESAFE_API_KEY?.trim());
+      const jevHealthy =
+        state.enabled &&
+        hasKey &&
+        !breakerActive(state) &&
+        !state.lastError;
+
+      const logical = logicalContextAtCompaction(
+        ctx,
+        state,
         config.truncateHeadChars,
       );
-      diagnostics.record("native_compaction_sanitized", {
-        reason: event.reason,
-        committed: state.decisions.size,
-        ...sanitized,
-      });
-    }
 
-    if (!state.enabled || event.reason !== "threshold") {
+      if (
+        event.reason === "threshold" &&
+        shouldDelayNativeThreshold(
+          logical.percent,
+          config.nativeFallbackPercent,
+          jevHealthy,
+        )
+      ) {
+        state.thresholdCancelledCount += 1;
+        diagnostics.record("before_compact", {
+          reason: event.reason,
+          outcome: "cancel_until_native_fallback",
+          willRetry: event.willRetry,
+          logicalTokens: logical.tokens,
+          logicalMessages: logical.messages,
+          logicalPercent:
+            logical.percent === null ? null : Number(logical.percent.toFixed(2)),
+          jevTriggerPercent: config.compactAtPercent,
+          nativeFallbackPercent: config.nativeFallbackPercent,
+          committed: state.decisions.size,
+          deferredDropCalls: state.deferredDropCalls.size,
+          thresholdCancelledCount: state.thresholdCancelledCount,
+        });
+        updateStatus(ctx, state);
+        return { cancel: true };
+      }
+
+      let sanitized: ApplyStats | undefined;
+      if (state.enabled && state.decisions.size > 0) {
+        sanitized = sanitizeCompactionPreparation(
+          event.preparation as typeof event.preparation & { fileOps: LocalFileOps },
+          event.branchEntries,
+          state.decisions,
+          config.truncateHeadChars,
+        );
+        diagnostics.record("native_compaction_sanitized", {
+          reason: event.reason,
+          committed: state.decisions.size,
+          ...sanitized,
+        });
+      }
+
+      if (event.reason === "threshold") state.thresholdPassedCount += 1;
       diagnostics.record("before_compact", {
         reason: event.reason,
-        outcome: state.enabled && sanitized ? "pass_sanitized" : "pass",
-        enabled: state.enabled,
-        willRetry: event.willRetry,
-        sanitized,
-      });
-      return;
-    }
-
-    state.active = true;
-    state.forceRefresh = true;
-
-    const hasKey = Boolean(process.env.TYPESAFE_API_KEY?.trim());
-    const contextWindow = ctx.getContextUsage()?.contextWindow ?? ctx.model?.contextWindow;
-    const logical = logicalContextAtCompaction(
-      event.branchEntries,
-      ctx,
-      state,
-      config.truncateHeadChars,
-    );
-    const nativeLimit =
-      contextWindow && contextWindow > 0
-        ? Math.max(0, contextWindow - event.preparation.settings.reserveTokens)
-        : undefined;
-    const hasHeadroom = hasNativeHeadroom(
-      logical.tokens,
-      contextWindow,
-      event.preparation.settings.reserveTokens,
-    );
-    const healthy =
-      hasKey &&
-      !breakerActive(state) &&
-      !state.lastError &&
-      !state.insufficient &&
-      state.decisions.size > 0 &&
-      hasHeadroom;
-
-    if (!healthy) {
-      state.thresholdPassedCount += 1;
-      diagnostics.record("before_compact", {
-        reason: event.reason,
-        outcome: "pass_native_sanitized",
+        outcome:
+          event.reason === "threshold"
+            ? "pass_native_fallback"
+            : sanitized
+              ? "pass_native_sanitized"
+              : "pass_native",
         willRetry: event.willRetry,
         hasKey,
         breaker: breakerActive(state),
         lastError: state.lastError,
-        insufficient: state.insufficient,
-        committed: state.decisions.size,
         logicalTokens: logical.tokens,
         logicalMessages: logical.messages,
-        contextWindow,
-        nativeLimit,
-        hasHeadroom,
+        logicalPercent:
+          logical.percent === null ? null : Number(logical.percent.toFixed(2)),
+        nativeFallbackPercent: config.nativeFallbackPercent,
         sanitized,
         thresholdPassedCount: state.thresholdPassedCount,
       });
       updateStatus(ctx, state);
       return;
+    } catch (error) {
+      state.lastError = `native compaction hook: ${errorText(error)}`;
+      diagnostics.record("before_compact_error", {
+        reason: event.reason,
+        willRetry: event.willRetry,
+        error: errorText(error),
+        outcome: "fail_open_to_native",
+      });
+      updateStatus(ctx, state);
+      // Never let a Jev integration error disable Pi's built-in safety net.
+      return;
     }
-
-    state.thresholdCancelledCount += 1;
-    diagnostics.record("before_compact", {
-      reason: event.reason,
-      outcome: "cancel_for_jev_headroom",
-      willRetry: event.willRetry,
-      committed: state.decisions.size,
-      logicalTokens: logical.tokens,
-      logicalMessages: logical.messages,
-      contextWindow,
-      nativeLimit,
-      hasHeadroom,
-      sanitized,
-      thresholdCancelledCount: state.thresholdCancelledCount,
-    });
-    updateStatus(ctx, state);
-    return { cancel: true };
   });
 
   pi.on("session_compact", (event, ctx) => {
@@ -1390,7 +1519,7 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
     state.insufficient = false;
     state.lastError = undefined;
     state.lastResult = undefined;
-    state.lastSuccessMs = 0;
+    state.pendingReductionTokens = 0;
     state.restoredDecisionCount = 0;
     persistLogicalState(pi, diagnostics, state, "native_compaction_tail");
     diagnostics.record("session_compact", {
@@ -1449,13 +1578,13 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
       : `unknown${rawWindow}`;
     const lines = [
       `fast-jev-compaction: enabled=${state.enabled} · at-threshold=${state.active} · evaluating=${state.evaluating}`,
-      `context: Pi≈${piContext} · Jev trigger=${config.compactAtPercent}%`,
+      `context: Pi≈${piContext} · Jev trigger=${config.compactAtPercent}% · native fallback=${config.nativeFallbackPercent}%`,
       `logical history≈${logicalContext} · calls=${state.lastLogicalToolCalls ?? "n/a"}; this is what the model and next Jev pass see`,
       `persisted Pi transcript≈${formatTokens(state.lastRawTokens ?? 0)}${rawWindow} (${(state.lastRawPercent ?? 0).toFixed(1)}%) · calls=${state.lastGrossToolCalls ?? "n/a"}; diagnostic only`,
-      `committed decisions: ${state.decisions.size} total · drop_call=${committedDropCalls} · drop_result=${committedDropResults} · keep=${committedKeeps} · restored=${state.restoredDecisionCount}`,
+      `committed decisions: ${state.decisions.size} total · drop_call=${committedDropCalls} · drop_result=${committedDropResults} · keep=${committedKeeps} · deferred drop_call=${state.deferredDropCalls.size} · restored=${state.restoredDecisionCount}`,
       `evaluations: ${state.evaluationSuccesses}/${state.evaluationAttempts} successful · Jev HTTP requests=${state.totalHttpRequests} total${state.lastEvaluationRequests !== undefined ? ` (last pass=${state.lastEvaluationRequests})` : ""}`,
       result
-        ? `last pass: incremental reduction=${percent(reductionRatio(result))} · eligible=${state.lastEvaluationEligible ?? "n/a"} · ${state.lastEvaluationMs ?? "n/a"}ms · Jev state≈${formatTokens(result.stats.stateTokens)} (${result.stats.stateStage || "n/a"})`
+        ? `last pass: mode=${state.lastEvaluationMode ?? "n/a"} · effective reduction=${state.lastEffectiveReduction === undefined ? "n/a" : percent(state.lastEffectiveReduction)} · upstream=${percent(reductionRatio(result))} · eligible=${state.lastEvaluationEligible ?? "n/a"} · ${state.lastEvaluationMs ?? "n/a"}ms · Jev state≈${formatTokens(result.stats.stateTokens)} (${result.stats.stateStage || "n/a"})`
         : "last pass: n/a",
       `last apply: ${lastApply}`,
       state.lastHttp
@@ -1485,6 +1614,10 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
   });
 
   pi.on("after_provider_response", (event) => {
+    // The provider response now carries usage for a request that already saw
+    // all decisions committed before this turn, so no pending correction from
+    // the previous turn is needed anymore.
+    state.pendingReductionTokens = 0;
     const durationMs = state.lastProviderRequestMs ? Date.now() - state.lastProviderRequestMs : undefined;
     state.lastProviderDurationMs = durationMs;
     state.lastProviderStatus = event.status;
@@ -1504,7 +1637,7 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
     });
   });
 
-  pi.on("turn_end", (event) => {
+  pi.on("turn_end", async (event, ctx) => {
     const message = event.message as unknown as {
       role?: string;
       content?: Array<{ type?: string; text?: string }>;
@@ -1534,12 +1667,84 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
       providerStatus: state.lastProviderStatus,
       providerDurationMs: state.lastProviderDurationMs,
     });
+
+    await evaluateAtTurnEnd(pi, ctx, config, diagnostics, state, event.turnIndex);
+  });
+
+  pi.on("agent_end", (event, ctx) => {
+    let finalStopReason: string | undefined;
+    for (let i = event.messages.length - 1; i >= 0; i--) {
+      const message = event.messages[i] as unknown as { role?: string; stopReason?: string };
+      if (message.role === "assistant") {
+        finalStopReason = message.stopReason;
+        break;
+      }
+    }
+
+    if (finalStopReason !== "stop" || state.deferredDropCalls.size === 0) {
+      diagnostics.record("agent_end", {
+        finalStopReason,
+        outcome:
+          state.deferredDropCalls.size === 0
+            ? "no_deferred_drop_calls"
+            : "defer_promotion_due_to_nonclean_end",
+        deferredDropCalls: state.deferredDropCalls.size,
+      });
+      updateStatus(ctx, state);
+      return;
+    }
+
+    const rawMessages = ctx.sessionManager.buildSessionContext().messages;
+    const rawIds = rawToolCallIds(rawMessages);
+    const before = new Map(state.decisions);
+    const beforeMessages = applyDecisionsDetailed(
+      rawMessages,
+      before,
+      decisionIds(before),
+      config.truncateHeadChars,
+    ).messages;
+    const beforeTokens = rawTokenEstimate(projectMessages(beforeMessages).messages, ctx);
+    let promoted = 0;
+
+    for (const [id, deferred] of state.deferredDropCalls) {
+      if (!rawIds.has(id)) continue;
+      const next: CachedDecision = { ...deferred, action: "drop_call" };
+      const previous = state.decisions.get(id);
+      if (!previous || ACTION_RANK[next.action] > ACTION_RANK[previous.action]) {
+        state.decisions.set(id, next);
+        promoted += 1;
+      }
+    }
+    state.deferredDropCalls.clear();
+
+    if (promoted > 0) {
+      const afterMessages = applyDecisionsDetailed(
+        rawMessages,
+        state.decisions,
+        decisionIds(state.decisions),
+        config.truncateHeadChars,
+      ).messages;
+      const afterTokens = rawTokenEstimate(projectMessages(afterMessages).messages, ctx);
+      state.pendingReductionTokens += Math.max(0, beforeTokens - afterTokens);
+      state.lastLogicalTokens = afterTokens;
+      const contextWindow = ctx.getContextUsage()?.contextWindow ?? ctx.model?.contextWindow;
+      state.lastLogicalPercent =
+        contextWindow && contextWindow > 0 ? (afterTokens / contextWindow) * 100 : undefined;
+      persistLogicalState(pi, diagnostics, state, "agent_end_promote_drop_calls");
+    }
+
+    diagnostics.record("agent_end", {
+      finalStopReason,
+      outcome: promoted > 0 ? "promoted_deferred_drop_calls" : "nothing_to_promote",
+      promoted,
+      committedBefore: before.size,
+      committedAfter: state.decisions.size,
+    });
+    updateStatus(ctx, state);
   });
 
   pi.on("agent_settled", () => {
-    state.settledGeneration += 1;
     diagnostics.record("agent_settled", {
-      generation: state.settledGeneration,
       contextHookId: state.lastContextHookId,
       contextOutcome: state.lastContextOutcome,
     });
@@ -1578,7 +1783,7 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
   });
 
   pi.registerCommand("jev-refresh", {
-    description: "Force Jev to re-evaluate old tool context on the next model call",
+    description: "Force Jev to re-evaluate old tool context at the next completed turn",
     handler: async (_args, ctx) => {
       state.enabled = true;
       state.active = true;
@@ -1589,7 +1794,7 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
       state.consecutiveFailures = 0;
       diagnostics.record("manual_refresh_armed");
       updateStatus(ctx, state);
-      notify(ctx, "fast-jev-compaction: refresh armed for the next model call");
+      notify(ctx, "fast-jev-compaction: refresh armed for the next completed turn");
     },
   });
 

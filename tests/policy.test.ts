@@ -2,8 +2,9 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   acceptsReduction,
-  hasNativeHeadroom,
-  shouldRefreshSettledEligible,
+  activeRunAction,
+  shouldDelayNativeThreshold,
+  shouldEvaluateAtTurnEnd,
 } from "../extensions/policy.ts";
 
 test("insufficient Jev reductions are rejected instead of committed", () => {
@@ -12,15 +13,22 @@ test("insufficient Jev reductions are rejected instead of committed", () => {
   assert.equal(acceptsReduction(0.80, 0.25), true);
 });
 
-test("new eligible calls refresh at most once per settled generation", () => {
-  assert.equal(shouldRefreshSettledEligible(true, 3, 2, true), true);
-  assert.equal(shouldRefreshSettledEligible(true, 3, 3, true), false);
-  assert.equal(shouldRefreshSettledEligible(true, 3, 2, false), false);
-  assert.equal(shouldRefreshSettledEligible(false, 3, 2, true), false);
+test("active agent runs never delete the tool-call breadcrumb", () => {
+  assert.equal(activeRunAction("keep"), "keep");
+  assert.equal(activeRunAction("drop_result"), "drop_result");
+  assert.equal(activeRunAction("drop_call"), "drop_result");
 });
 
-test("native compaction is cancelled only when logical context fits Pi's native limit", () => {
-  assert.equal(hasNativeHeadroom(80_000, 100_000, 20_000), true);
-  assert.equal(hasNativeHeadroom(80_001, 100_000, 20_000), false);
-  assert.equal(hasNativeHeadroom(10_000, undefined, 20_000), false);
+test("Jev evaluates at turn_end only when armed or forced", () => {
+  assert.equal(shouldEvaluateAtTurnEnd(79.9, 80, false, true), false);
+  assert.equal(shouldEvaluateAtTurnEnd(80, 80, false, true), true);
+  assert.equal(shouldEvaluateAtTurnEnd(40, 80, true, true), true);
+  assert.equal(shouldEvaluateAtTurnEnd(90, 80, false, false), false);
+});
+
+test("native threshold is delayed to the fallback boundary only while Jev is healthy", () => {
+  assert.equal(shouldDelayNativeThreshold(87.4, 87.5, true), true);
+  assert.equal(shouldDelayNativeThreshold(87.5, 87.5, true), false);
+  assert.equal(shouldDelayNativeThreshold(76, 87.5, false), false);
+  assert.equal(shouldDelayNativeThreshold(null, 87.5, true), false);
 });
