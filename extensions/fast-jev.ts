@@ -17,6 +17,11 @@ import {
   type ToolCall as JevToolCall,
 } from "./fast-jev-core.ts";
 import { Diagnostics, summarizeDiagnostic } from "./diagnostics.ts";
+import {
+  acceptsReduction,
+  hasNativeHeadroom,
+  shouldRefreshSettledEligible,
+} from "./policy.ts";
 
 const STATUS_KEY = "fast-jev";
 const STATE_ENTRY_TYPE = "fast-jev-compaction-state";
@@ -1016,9 +1021,12 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
       if (state.forceRefresh) refreshReasons.push("forced");
       if (state.active && !wasAtThreshold) refreshReasons.push("threshold_crossed");
       if (
-        state.active &&
-        state.settledGeneration > state.lastEvaluatedSettledGeneration &&
-        hasUnscoredEligibleCall(calls, state)
+        shouldRefreshSettledEligible(
+          state.active,
+          state.settledGeneration,
+          state.lastEvaluatedSettledGeneration,
+          hasUnscoredEligibleCall(calls, state),
+        )
       ) {
         refreshReasons.push("settled_unscored_eligible_call");
       }
@@ -1125,7 +1133,7 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
           const ratio = reductionRatio(evaluation.result);
           const proposed = decisionMap(evaluation.result, evaluation.calls);
           const beforeMerge = new Map(state.decisions);
-          const accepted = ratio >= config.minReductionRatio;
+          const accepted = acceptsReduction(ratio, config.minReductionRatio);
           if (accepted) {
             state.decisions = mergeMonotonicDecisions(beforeMerge, proposed, rawIds);
             persistLogicalState(pi, diagnostics, state, "jev_pass");
@@ -1318,7 +1326,11 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
       contextWindow && contextWindow > 0
         ? Math.max(0, contextWindow - event.preparation.settings.reserveTokens)
         : undefined;
-    const hasHeadroom = nativeLimit !== undefined && logical.tokens <= nativeLimit;
+    const hasHeadroom = hasNativeHeadroom(
+      logical.tokens,
+      contextWindow,
+      event.preparation.settings.reserveTokens,
+    );
     const healthy =
       hasKey &&
       !breakerActive(state) &&
