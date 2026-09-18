@@ -1144,10 +1144,18 @@ async function evaluateAtTurnEnd(
     ...projection.protectedToolCallIds,
     ...sourceEvidenceIds,
   ]);
+  // Use the exact same protection set for both local eligibility accounting
+  // and the compactMessages() call. 0.6.1 only used protectedIds here, while
+  // evaluate() still received projection.protectedToolCallIds; Jev therefore
+  // scored and pruned reads that diagnostics reported as protected.
+  const evaluationProjection: Projection = {
+    ...projection,
+    protectedToolCallIds: protectedIds,
+  };
   const calls = collectToolCalls(
-    projection.messages,
+    evaluationProjection.messages,
     config.preserveRecentMessages,
-    protectedIds,
+    evaluationProjection.protectedToolCallIds,
   );
   const eligibleNow = eligibleToolIds(calls);
   const previouslyEvaluatedNow = new Set(
@@ -1279,7 +1287,7 @@ async function evaluateAtTurnEnd(
 
   try {
     const evaluation = await evaluate(
-      projection,
+      evaluationProjection,
       calls,
       logicalTokens,
       config,
@@ -1413,7 +1421,7 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
   };
 
   diagnostics.record("extension_loaded", {
-    version: "0.6.1",
+    version: "0.6.2",
     compactAtPercent: config.compactAtPercent,
     nativeFallbackPercent: config.nativeFallbackPercent,
     minReductionRatio: config.minReductionRatio,
