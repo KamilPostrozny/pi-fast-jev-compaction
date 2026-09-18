@@ -826,8 +826,8 @@ function showEvaluationActivity(
 ): void {
   const reason = refreshReasons.includes("forced")
     ? "forced refresh"
-    : refreshReasons.includes("threshold_crossed")
-      ? "context threshold crossed"
+    : refreshReasons.includes("turn_end_threshold")
+      ? "completed turn reached threshold"
       : "newly eligible tools";
   ctx.ui.setStatus(STATUS_KEY, `Jev compacting… ${eligible} calls`);
   if (ctx.mode === "tui") {
@@ -1612,7 +1612,7 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
     });
   });
 
-  pi.on("turn_end", (event) => {
+  pi.on("turn_end", async (event, ctx) => {
     const message = event.message as unknown as {
       role?: string;
       content?: Array<{ type?: string; text?: string }>;
@@ -1642,12 +1642,66 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
       providerStatus: state.lastProviderStatus,
       providerDurationMs: state.lastProviderDurationMs,
     });
+
+    await evaluateAtTurnEnd(pi, ctx, config, diagnostics, state, event.turnIndex);
+  });
+
+  pi.on("agent_end", (event, ctx) => {
+    let finalStopReason: string | undefined;
+    for (let i = event.messages.length - 1; i >= 0; i--) {
+      const message = event.messages[i] as unknown as { role?: string; stopReason?: string };
+      if (message.role === "assistant") {
+        finalStopReason = message.stopReason;
+        break;
+      }
+    }
+
+    if (finalStopReason !== "stop" || state.deferredDropCalls.size === 0) {
+      diagnostics.record("agent_end", {
+        finalStopReason,
+        outcome:
+          state.deferredDropCalls.size === 0
+            ? "no_deferred_drop_calls"
+            : "defer_promotion_due_to_nonclean_end",
+        deferredDropCalls: state.deferredDropCalls.size,
+      });
+      updateStatus(ctx, state);
+      return;
+    }
+
+    const rawMessages = ctx.sessionManager.buildSessionContext().messages;
+    const rawIds = rawToolCallIds(rawMessages);
+    const before = new Map(state.decisions);
+    let promoted = 0;
+
+    for (const [id, deferred] of state.deferredDropCalls) {
+      if (!rawIds.has(id)) continue;
+      const next: CachedDecision = { ...deferred, action: "drop_call" };
+      const previous = state.decisions.get(id);
+      if (!previous || ACTION_RANK[next.action] > ACTION_RANK[previous.action]) {
+        state.decisions.set(id, next);
+        promoted += 1;
+      }
+    }
+    state.deferredDropCalls.clear();
+
+    if (promoted > 0) {
+      persistLogicalState(pi, diagnostics, state, "agent_end_promote_drop_calls");
+      state.lastEvaluationMode = "agent_end_promote";
+    }
+
+    diagnostics.record("agent_end", {
+      finalStopReason,
+      outcome: promoted > 0 ? "promoted_deferred_drop_calls" : "nothing_to_promote",
+      promoted,
+      committedBefore: before.size,
+      committedAfter: state.decisions.size,
+    });
+    updateStatus(ctx, state);
   });
 
   pi.on("agent_settled", () => {
-    state.settledGeneration += 1;
     diagnostics.record("agent_settled", {
-      generation: state.settledGeneration,
       contextHookId: state.lastContextHookId,
       contextOutcome: state.lastContextOutcome,
     });
@@ -1686,7 +1740,7 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
   });
 
   pi.registerCommand("jev-refresh", {
-    description: "Force Jev to re-evaluate old tool context on the next model call",
+    description: "Force Jev to re-evaluate old tool context at the next completed turn",
     handler: async (_args, ctx) => {
       state.enabled = true;
       state.active = true;
@@ -1697,7 +1751,7 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
       state.consecutiveFailures = 0;
       diagnostics.record("manual_refresh_armed");
       updateStatus(ctx, state);
-      notify(ctx, "fast-jev-compaction: refresh armed for the next model call");
+      notify(ctx, "fast-jev-compaction: refresh armed for the next completed turn");
     },
   });
 
