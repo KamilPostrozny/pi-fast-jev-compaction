@@ -397,6 +397,39 @@ function rawTokenEstimate(projected: readonly JevMessage[], ctx: ExtensionContex
   return conversation + system;
 }
 
+interface PressureSnapshot {
+  contextWindow?: number;
+  providerTokens?: number;
+  providerPercent?: number;
+  logicalPercent?: number;
+  pressurePercent: number | null;
+}
+
+function pressureSnapshot(
+  logicalTokens: number,
+  ctx: ExtensionContext,
+  state: RuntimeState,
+): PressureSnapshot {
+  const usage = ctx.getContextUsage();
+  const contextWindow = usage?.contextWindow ?? ctx.model?.contextWindow;
+  const logicalPercent =
+    contextWindow && contextWindow > 0 ? (logicalTokens / contextWindow) * 100 : undefined;
+  const pressurePercent = calibratedPressurePercent({
+    logicalTokens,
+    contextWindow,
+    providerTokens: usage?.tokens,
+    providerPercent: usage?.percent,
+    pendingReductionTokens: state.pendingReductionTokens,
+  });
+  return {
+    contextWindow,
+    providerTokens: usage?.tokens ?? undefined,
+    providerPercent: usage?.percent ?? undefined,
+    logicalPercent,
+    pressurePercent,
+  };
+}
+
 function percent(value: number): string {
   return `${Math.round(value * 100)}%`;
 }
