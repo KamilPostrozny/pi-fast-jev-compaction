@@ -1,7 +1,7 @@
 {
   "name": "pi-fast-jev-compaction",
-  "version": "0.5.0",
-  "description": "Adaptive turn-end Jev pruning for Pi with explicit result placeholders and native fallback.",
+  "version": "0.6.0",
+  "description": "Calibrated context-relative Jev pruning for Pi with grounding safeguards and native fallback.",
   "type": "module",
   "license": "MIT",
   "keywords": [
