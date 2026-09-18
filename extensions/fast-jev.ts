@@ -17,8 +17,10 @@ import { Diagnostics, summarizeDiagnostic } from "./diagnostics.ts";
 import {
   acceptsReduction,
   activeRunAction,
+  requiredNewResultTokens,
   shouldDelayNativeThreshold,
   shouldEvaluateAtTurnEnd,
+  type TurnEndEvaluationPolicy,
 } from "./policy.ts";
 
 const STATUS_KEY = "fast-jev";
@@ -28,12 +30,16 @@ const STATE_SCHEMA_VERSION = 1;
 export interface Config {
   compactAtPercent: number;
   nativeFallbackPercent: number;
+  reevaluateMidPercent: number;
+  reevaluateUrgentPercent: number;
+  reevaluateLowResultTokens: number;
+  reevaluateMidResultTokens: number;
+  reevaluateUrgentResultTokens: number;
   minReductionRatio: number;
   keepThreshold: number;
   preserveRecentMessages: number;
   maxStateTokens: number;
   maxRequestTokens: number;
-  truncateHeadChars: number;
   model: string;
   baseUrl?: string;
   goal?: string;
@@ -48,14 +54,18 @@ export interface Config {
 }
 
 const DEFAULTS: Config = {
-  compactAtPercent: 80,
+  compactAtPercent: 75,
   nativeFallbackPercent: 87.5,
-  minReductionRatio: 0.25,
+  reevaluateMidPercent: 80,
+  reevaluateUrgentPercent: 84,
+  reevaluateLowResultTokens: 2_000,
+  reevaluateMidResultTokens: 1_000,
+  reevaluateUrgentResultTokens: 1,
+  minReductionRatio: 0.01,
   keepThreshold: 0.5,
   preserveRecentMessages: 6,
   maxStateTokens: 25_000,
   maxRequestTokens: 30_000,
-  truncateHeadChars: 300,
   model: "jev-latest",
   requestTimeoutMs: 8_000,
   evaluationTimeoutMs: 12_000,
@@ -98,7 +108,7 @@ interface Evaluation {
 interface ApplyStats {
   droppedCalls: number;
   droppedResults: number;
-  truncatedResults: number;
+  prunedResults: number;
   messagesBefore: number;
   messagesAfter: number;
 }
@@ -161,6 +171,9 @@ interface RuntimeState {
   lastEvaluationMode?: "active_result_only";
   lastEffectiveReduction?: number;
   pendingReductionTokens: number;
+  lastEvaluatedEligibleIds: Set<string>;
+  lastNewEligibleResultTokens?: number;
+  lastRequiredNewResultTokens?: number | null;
 }
 
 function envNumber(name: string, fallback: number): number {
@@ -193,11 +206,33 @@ export function resolveConfig(): Config {
     Math.floor(envNumber("PI_JEV_EVALUATION_TIMEOUT_MS", DEFAULTS.evaluationTimeoutMs)),
   );
   const compactAtPercent = envNumber("PI_JEV_COMPACT_AT_PERCENT", DEFAULTS.compactAtPercent);
+  const reevaluateMidPercent = Math.max(
+    compactAtPercent,
+    envNumber("PI_JEV_REEVALUATE_MID_PERCENT", DEFAULTS.reevaluateMidPercent),
+  );
+  const reevaluateUrgentPercent = Math.max(
+    reevaluateMidPercent,
+    envNumber("PI_JEV_REEVALUATE_URGENT_PERCENT", DEFAULTS.reevaluateUrgentPercent),
+  );
   const config: Config = {
     compactAtPercent,
     nativeFallbackPercent: Math.max(
-      compactAtPercent,
+      reevaluateUrgentPercent,
       envNumber("PI_JEV_NATIVE_FALLBACK_PERCENT", DEFAULTS.nativeFallbackPercent),
+    ),
+    reevaluateMidPercent,
+    reevaluateUrgentPercent,
+    reevaluateLowResultTokens: Math.max(
+      1,
+      Math.floor(envNumber("PI_JEV_REEVALUATE_LOW_RESULT_TOKENS", DEFAULTS.reevaluateLowResultTokens)),
+    ),
+    reevaluateMidResultTokens: Math.max(
+      1,
+      Math.floor(envNumber("PI_JEV_REEVALUATE_MID_RESULT_TOKENS", DEFAULTS.reevaluateMidResultTokens)),
+    ),
+    reevaluateUrgentResultTokens: Math.max(
+      1,
+      Math.floor(envNumber("PI_JEV_REEVALUATE_URGENT_RESULT_TOKENS", DEFAULTS.reevaluateUrgentResultTokens)),
     ),
     minReductionRatio: envNumber("PI_JEV_MIN_REDUCTION_RATIO", DEFAULTS.minReductionRatio),
     keepThreshold: envNumber("PI_JEV_KEEP_THRESHOLD", DEFAULTS.keepThreshold),
@@ -207,10 +242,6 @@ export function resolveConfig(): Config {
     ),
     maxStateTokens: Math.max(1, envNumber("PI_JEV_MAX_STATE_TOKENS", DEFAULTS.maxStateTokens)),
     maxRequestTokens: Math.max(1, envNumber("PI_JEV_MAX_REQUEST_TOKENS", DEFAULTS.maxRequestTokens)),
-    truncateHeadChars: Math.max(
-      0,
-      Math.floor(envNumber("PI_JEV_TRUNCATE_HEAD_CHARS", DEFAULTS.truncateHeadChars)),
-    ),
     model: envString("PI_JEV_MODEL") ?? DEFAULTS.model,
     requestTimeoutMs,
     evaluationTimeoutMs,
@@ -374,24 +405,22 @@ function formatTokens(value: number): string {
   return `${Math.round(value / 1000)}k`;
 }
 
-function truncateResultText(text: string, isError: boolean, headChars: number): string {
-  if (text.length <= headChars + 120) return text;
-  const head = headChars > 0 ? `${text.slice(0, headChars)}\n` : "";
-  return `${head}[fast-jev-compaction truncated ${text.length - headChars} chars of this tool result${
-    isError ? " (error)" : ""
-  }; re-run the tool if needed]`;
+function prunedResultText(text: string, isError: boolean): string {
+  const marker =
+    `[fast-jev-compaction: result pruned${isError ? " (error)" : ""}; re-run this tool before relying on its output]`;
+  // Do not make tiny results larger just to say they were pruned.
+  return text.length <= marker.length ? text : marker;
 }
 
 function applyDecisionsDetailed(
   messages: readonly AgentMessage[],
   decisions: ReadonlyMap<string, CachedDecision>,
   eligibleIds: ReadonlySet<string>,
-  truncateHeadChars: number,
 ): { messages: AgentMessage[]; stats: ApplyStats } {
   const output: AgentMessage[] = [];
   let droppedCalls = 0;
   let droppedResults = 0;
-  let truncatedResults = 0;
+  let prunedResults = 0;
 
   for (const message of messages) {
     if (message.role === "assistant") {
@@ -420,12 +449,12 @@ function applyDecisionsDetailed(
       }
       if (decision?.action === "drop_result") {
         const original = textContent(message.content);
-        const truncated = truncateResultText(original, message.isError, truncateHeadChars);
-        if (truncated !== original) {
-          truncatedResults += 1;
+        const pruned = prunedResultText(original, message.isError);
+        if (pruned !== original) {
+          prunedResults += 1;
           output.push({
             ...message,
-            content: [{ type: "text", text: truncated }],
+            content: [{ type: "text", text: pruned }],
           });
           continue;
         }
@@ -439,7 +468,7 @@ function applyDecisionsDetailed(
     stats: {
       droppedCalls,
       droppedResults,
-      truncatedResults,
+      prunedResults,
       messagesBefore: messages.length,
       messagesAfter: output.length,
     },
@@ -451,9 +480,8 @@ export function applyDecisionsToPi(
   messages: readonly AgentMessage[],
   decisions: ReadonlyMap<string, CachedDecision>,
   eligibleIds: ReadonlySet<string>,
-  truncateHeadChars: number,
 ): AgentMessage[] {
-  return applyDecisionsDetailed(messages, decisions, eligibleIds, truncateHeadChars).messages;
+  return applyDecisionsDetailed(messages, decisions, eligibleIds).messages;
 }
 
 function decisionMap(result: CompactResult, calls: readonly JevToolCall[]): Map<string, CachedDecision> {
@@ -508,14 +536,12 @@ function projectedChars(messages: readonly JevMessage[]): number {
 function activeReductionRatio(
   messages: readonly AgentMessage[],
   decisions: ReadonlyMap<string, CachedDecision>,
-  truncateHeadChars: number,
 ): number {
   const before = projectMessages(messages).messages;
   const afterPi = applyDecisionsDetailed(
     messages,
     decisions,
     decisionIds(decisions),
-    truncateHeadChars,
   ).messages;
   const after = projectMessages(afterPi).messages;
   const charsBefore = projectedChars(before);
@@ -610,6 +636,9 @@ function restoreLogicalState(
 
   state.decisions = restored;
   state.deferredDropCalls.clear();
+  state.lastEvaluatedEligibleIds.clear();
+  state.lastNewEligibleResultTokens = undefined;
+  state.lastRequiredNewResultTokens = undefined;
   state.restoredDecisionCount = restored.size;
   state.lastResult = undefined;
   state.lastEffectiveReduction = undefined;
@@ -632,8 +661,35 @@ function eligibleToolIds(calls: readonly JevToolCall[]): Set<string> {
   return new Set(calls.filter((call) => !call.pinned).map((call) => call.tool_use_id));
 }
 
-function hasUnscoredEligibleCall(calls: readonly JevToolCall[], state: RuntimeState): boolean {
-  return calls.some((call) => !call.pinned && !state.decisions.has(call.tool_use_id));
+function newEligibleToolIds(
+  eligibleIds: ReadonlySet<string>,
+  lastEvaluatedIds: ReadonlySet<string>,
+): Set<string> {
+  return new Set([...eligibleIds].filter((id) => !lastEvaluatedIds.has(id)));
+}
+
+function toolResultTokenVolume(
+  messages: readonly JevMessage[],
+  ids: ReadonlySet<string>,
+): number {
+  let total = 0;
+  for (const message of messages) {
+    for (const result of message.toolResults ?? []) {
+      if (ids.has(result.tool_use_id)) total += estimateTokens(result.text);
+    }
+  }
+  return total;
+}
+
+function evaluationPolicy(config: Config): TurnEndEvaluationPolicy {
+  return {
+    triggerPercent: config.compactAtPercent,
+    midPercent: config.reevaluateMidPercent,
+    urgentPercent: config.reevaluateUrgentPercent,
+    lowPressureResultTokens: config.reevaluateLowResultTokens,
+    midPressureResultTokens: config.reevaluateMidResultTokens,
+    urgentResultTokens: config.reevaluateUrgentResultTokens,
+  };
 }
 
 function errorText(error: unknown): string {
@@ -768,7 +824,7 @@ async function evaluate(
       protectedToolUseIds: projected.protectedToolCallIds,
       maxStateTokens: config.maxStateTokens,
       maxRequestTokens: config.maxRequestTokens,
-      truncateHeadChars: config.truncateHeadChars,
+      truncateHeadChars: 0,
       fetch: makeDiagnosticFetch(diagnostics, config, controller.signal, state),
     });
     const hardDeadline = new Promise<never>((_resolve, reject) => {
@@ -924,20 +980,17 @@ function sanitizeCompactionPreparation(
   },
   branchEntries: readonly unknown[],
   decisions: ReadonlyMap<string, CachedDecision>,
-  truncateHeadChars: number,
 ): ApplyStats {
   const ids = decisionIds(decisions);
   const history = applyDecisionsDetailed(
     preparation.messagesToSummarize,
     decisions,
     ids,
-    truncateHeadChars,
   );
   const prefix = applyDecisionsDetailed(
     preparation.turnPrefixMessages,
     decisions,
     ids,
-    truncateHeadChars,
   );
 
   preparation.messagesToSummarize = history.messages;
@@ -950,7 +1003,7 @@ function sanitizeCompactionPreparation(
   return {
     droppedCalls: history.stats.droppedCalls + prefix.stats.droppedCalls,
     droppedResults: history.stats.droppedResults + prefix.stats.droppedResults,
-    truncatedResults: history.stats.truncatedResults + prefix.stats.truncatedResults,
+    prunedResults: history.stats.prunedResults + prefix.stats.prunedResults,
     messagesBefore: history.stats.messagesBefore + prefix.stats.messagesBefore,
     messagesAfter: history.stats.messagesAfter + prefix.stats.messagesAfter,
   };
@@ -959,14 +1012,12 @@ function sanitizeCompactionPreparation(
 function logicalContextAtCompaction(
   ctx: ExtensionContext,
   state: RuntimeState,
-  truncateHeadChars: number,
 ): { tokens: number; messages: number; percent: number | null } {
   const raw = ctx.sessionManager.buildSessionContext().messages;
   const logical = applyDecisionsDetailed(
     raw,
     state.decisions,
     decisionIds(state.decisions),
-    truncateHeadChars,
   ).messages;
   const projection = projectMessages(logical);
   const tokens = rawTokenEstimate(projection.messages, ctx);
@@ -1041,12 +1092,14 @@ async function evaluateAtTurnEnd(
   for (const id of [...state.deferredDropCalls.keys()]) {
     if (!rawIds.has(id)) state.deferredDropCalls.delete(id);
   }
+  for (const id of [...state.lastEvaluatedEligibleIds]) {
+    if (!rawIds.has(id)) state.lastEvaluatedEligibleIds.delete(id);
+  }
 
   const logicalBefore = applyDecisionsDetailed(
     rawMessages,
     state.decisions,
     decisionIds(state.decisions),
-    config.truncateHeadChars,
   ).messages;
   const projection = projectMessages(logicalBefore);
   const calls = collectToolCalls(
@@ -1055,7 +1108,11 @@ async function evaluateAtTurnEnd(
     projection.protectedToolCallIds,
   );
   const eligibleNow = eligibleToolIds(calls);
-  const unscored = hasUnscoredEligibleCall(calls, state);
+  const previouslyEvaluatedNow = new Set(
+    [...state.lastEvaluatedEligibleIds].filter((id) => eligibleNow.has(id)),
+  );
+  const newEligibleIds = newEligibleToolIds(eligibleNow, state.lastEvaluatedEligibleIds);
+  const newEligibleResultTokens = toolResultTokenVolume(projection.messages, newEligibleIds);
 
   const usage = ctx.getContextUsage();
   const contextWindow = usage?.contextWindow ?? ctx.model?.contextWindow;
@@ -1063,6 +1120,8 @@ async function evaluateAtTurnEnd(
   const logicalPercent =
     contextWindow && contextWindow > 0 ? (logicalTokens / contextWindow) * 100 : null;
   const effectivePercent = usage?.percent ?? logicalPercent;
+  const policy = evaluationPolicy(config);
+  const requiredResultTokens = requiredNewResultTokens(effectivePercent, policy);
 
   state.lastPiTokens = usage?.tokens ?? undefined;
   state.lastPiPercent = effectivePercent ?? undefined;
@@ -1070,23 +1129,33 @@ async function evaluateAtTurnEnd(
   state.lastLogicalTokens = logicalTokens;
   state.lastLogicalPercent = logicalPercent ?? undefined;
   state.lastLogicalToolCalls = calls.length;
+  state.lastNewEligibleResultTokens = newEligibleResultTokens;
+  state.lastRequiredNewResultTokens = requiredResultTokens;
   state.active = effectivePercent !== null && effectivePercent >= config.compactAtPercent;
 
   const forceRefresh = state.forceRefresh;
-  const shouldEvaluate = shouldEvaluateAtTurnEnd(
+  const shouldEvaluate = shouldEvaluateAtTurnEnd({
     effectivePercent,
-    config.compactAtPercent,
     forceRefresh,
-    forceRefresh ? eligibleNow.size > 0 : unscored,
-  );
+    eligibleCalls: eligibleNow.size,
+    previouslyEvaluatedCalls: previouslyEvaluatedNow.size,
+    newEligibleCalls: newEligibleIds.size,
+    newEligibleResultTokens,
+    policy,
+  });
 
   diagnostics.record("turn_evaluation_check", {
     turnIndex,
     effectivePercent: effectivePercent === null ? null : Number(effectivePercent.toFixed(2)),
     logicalPercent: logicalPercent === null ? null : Number(logicalPercent.toFixed(2)),
     triggerPercent: config.compactAtPercent,
+    midPercent: config.reevaluateMidPercent,
+    urgentPercent: config.reevaluateUrgentPercent,
     eligible: eligibleNow.size,
-    unscored,
+    previouslyEvaluatedEligible: previouslyEvaluatedNow.size,
+    newEligibleCalls: newEligibleIds.size,
+    newEligibleResultTokens,
+    requiredNewResultTokens: requiredResultTokens,
     forced: forceRefresh,
     shouldEvaluate,
     committed: state.decisions.size,
@@ -1151,6 +1220,9 @@ async function evaluateAtTurnEnd(
     committedBefore: state.decisions.size,
     logicalTokens,
     effectivePercent: effectivePercent === null ? null : Number(effectivePercent.toFixed(2)),
+    newEligibleCalls: newEligibleIds.size,
+    newEligibleResultTokens,
+    requiredNewResultTokens: requiredResultTokens,
     timeoutMs: config.evaluationTimeoutMs,
   });
 
@@ -1164,12 +1236,12 @@ async function evaluateAtTurnEnd(
       diagnostics,
       state,
     );
+    state.lastEvaluatedEligibleIds = new Set(eligibleNow);
     const upstreamRatio = reductionRatio(evaluation.result);
     const activeMaps = activeDecisionMaps(evaluation.result, evaluation.calls);
     const effectiveRatio = activeReductionRatio(
       logicalBefore,
       activeMaps.committed,
-      config.truncateHeadChars,
     );
     const accepted = acceptsReduction(effectiveRatio, config.minReductionRatio);
     const beforeMerge = new Map(state.decisions);
@@ -1179,7 +1251,7 @@ async function evaluateAtTurnEnd(
 
       // Only the latest accepted evaluation controls which full deletions are
       // eligible for promotion at agent_end. Until then every such call remains
-      // as a breadcrumb with at most its result truncated.
+      // as a breadcrumb while its result contents are explicitly pruned.
       for (const call of evaluation.calls) {
         if (!call.pinned) state.deferredDropCalls.delete(call.tool_use_id);
       }
@@ -1207,7 +1279,6 @@ async function evaluateAtTurnEnd(
         rawMessages,
         state.decisions,
         decisionIds(state.decisions),
-        config.truncateHeadChars,
       );
       const postProjection = projectMessages(applied.messages);
       const postTokens = rawTokenEstimate(postProjection.messages, ctx);
@@ -1233,6 +1304,9 @@ async function evaluateAtTurnEnd(
       committedBefore: beforeMerge.size,
       committedAfter: state.decisions.size,
       deferredDropCalls: state.deferredDropCalls.size,
+      evaluatedEligibleBaseline: state.lastEvaluatedEligibleIds.size,
+      newEligibleResultTokens,
+      requiredNewResultTokens: requiredResultTokens,
       actions: countActions(evaluation.result),
       accepted,
     });
@@ -1284,12 +1358,19 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
     providerRequestCount: 0,
     deferredDropCalls: new Map(),
     pendingReductionTokens: 0,
+    lastEvaluatedEligibleIds: new Set(),
   };
 
   diagnostics.record("extension_loaded", {
-    version: "0.4.0",
+    version: "0.5.0",
     compactAtPercent: config.compactAtPercent,
     nativeFallbackPercent: config.nativeFallbackPercent,
+    reevaluateMidPercent: config.reevaluateMidPercent,
+    reevaluateUrgentPercent: config.reevaluateUrgentPercent,
+    reevaluateLowResultTokens: config.reevaluateLowResultTokens,
+    reevaluateMidResultTokens: config.reevaluateMidResultTokens,
+    reevaluateUrgentResultTokens: config.reevaluateUrgentResultTokens,
+    minReductionRatio: config.minReductionRatio,
     requestTimeoutMs: config.requestTimeoutMs,
     evaluationTimeoutMs: config.evaluationTimeoutMs,
     circuitBreakerFailures: config.circuitBreakerFailures,
@@ -1335,7 +1416,6 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
         event.messages,
         state.decisions,
         decisionIds(state.decisions),
-        config.truncateHeadChars,
       );
       const logicalMessages = applied.messages;
       const grossProjection = projectMessages(event.messages);
@@ -1428,7 +1508,6 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
       const logical = logicalContextAtCompaction(
         ctx,
         state,
-        config.truncateHeadChars,
       );
 
       if (
@@ -1464,7 +1543,6 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
           event.preparation as typeof event.preparation & { fileOps: LocalFileOps },
           event.branchEntries,
           state.decisions,
-          config.truncateHeadChars,
         );
         diagnostics.record("native_compaction_sanitized", {
           reason: event.reason,
@@ -1520,6 +1598,9 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
     state.lastError = undefined;
     state.lastResult = undefined;
     state.pendingReductionTokens = 0;
+    state.lastEvaluatedEligibleIds.clear();
+    state.lastNewEligibleResultTokens = undefined;
+    state.lastRequiredNewResultTokens = undefined;
     state.restoredDecisionCount = 0;
     persistLogicalState(pi, diagnostics, state, "native_compaction_tail");
     diagnostics.record("session_compact", {
@@ -1568,7 +1649,7 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
       ? `${formatTokens(state.lastPiTokens)}${rawWindow} (${(state.lastPiPercent ?? 0).toFixed(1)}%)`
       : `unknown${rawWindow}`;
     const lastApply = state.lastApply
-      ? `dropped calls=${state.lastApply.droppedCalls}, dropped results=${state.lastApply.droppedResults}, truncated results=${state.lastApply.truncatedResults}`
+      ? `dropped calls=${state.lastApply.droppedCalls}, dropped results=${state.lastApply.droppedResults}, pruned results=${state.lastApply.prunedResults}`
       : "n/a";
     const committedDropCalls = [...state.decisions.values()].filter((decision) => decision.action === "drop_call").length;
     const committedDropResults = [...state.decisions.values()].filter((decision) => decision.action === "drop_result").length;
@@ -1578,11 +1659,12 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
       : `unknown${rawWindow}`;
     const lines = [
       `fast-jev-compaction: enabled=${state.enabled} · at-threshold=${state.active} · evaluating=${state.evaluating}`,
-      `context: Pi≈${piContext} · Jev trigger=${config.compactAtPercent}% · native fallback=${config.nativeFallbackPercent}%`,
+      `context: Pi≈${piContext} · Jev trigger=${config.compactAtPercent}% · adaptive=${config.reevaluateMidPercent}%/${config.reevaluateUrgentPercent}% · native fallback=${config.nativeFallbackPercent}%`,
       `logical history≈${logicalContext} · calls=${state.lastLogicalToolCalls ?? "n/a"}; this is what the model and next Jev pass see`,
       `persisted Pi transcript≈${formatTokens(state.lastRawTokens ?? 0)}${rawWindow} (${(state.lastRawPercent ?? 0).toFixed(1)}%) · calls=${state.lastGrossToolCalls ?? "n/a"}; diagnostic only`,
       `committed decisions: ${state.decisions.size} total · drop_call=${committedDropCalls} · drop_result=${committedDropResults} · keep=${committedKeeps} · deferred drop_call=${state.deferredDropCalls.size} · restored=${state.restoredDecisionCount}`,
       `evaluations: ${state.evaluationSuccesses}/${state.evaluationAttempts} successful · Jev HTTP requests=${state.totalHttpRequests} total${state.lastEvaluationRequests !== undefined ? ` (last pass=${state.lastEvaluationRequests})` : ""}`,
+      `reevaluation: new result≈${formatTokens(state.lastNewEligibleResultTokens ?? 0)} tokens · required=${state.lastRequiredNewResultTokens === null || state.lastRequiredNewResultTokens === undefined ? "n/a" : formatTokens(state.lastRequiredNewResultTokens)} · baseline calls=${state.lastEvaluatedEligibleIds.size}`,
       result
         ? `last pass: mode=${state.lastEvaluationMode ?? "n/a"} · effective reduction=${state.lastEffectiveReduction === undefined ? "n/a" : percent(state.lastEffectiveReduction)} · upstream=${percent(reductionRatio(result))} · eligible=${state.lastEvaluationEligible ?? "n/a"} · ${state.lastEvaluationMs ?? "n/a"}ms · Jev state≈${formatTokens(result.stats.stateTokens)} (${result.stats.stateStage || "n/a"})`
         : "last pass: n/a",
@@ -1701,7 +1783,6 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
       rawMessages,
       before,
       decisionIds(before),
-      config.truncateHeadChars,
     ).messages;
     const beforeTokens = rawTokenEstimate(projectMessages(beforeMessages).messages, ctx);
     let promoted = 0;
@@ -1722,7 +1803,6 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
         rawMessages,
         state.decisions,
         decisionIds(state.decisions),
-        config.truncateHeadChars,
       ).messages;
       const afterTokens = rawTokenEstimate(projectMessages(afterMessages).messages, ctx);
       state.pendingReductionTokens += Math.max(0, beforeTokens - afterTokens);
