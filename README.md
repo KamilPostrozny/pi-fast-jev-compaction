@@ -4,6 +4,32 @@ A Pi package port of [`tamaratran/fast-jev-compaction`](https://github.com/tamar
 
 It uses TypeSafe Jev to decide, tool call by tool call, which old calls/results still need to remain in model context. User and assistant prose is not summarized or rewritten by this extension. Pi's persisted session transcript stays intact.
 
+## 0.5.0: adaptive result pruning
+
+0.5.0 tunes the turn-end strategy for long autonomous coding runs on small local context windows.
+
+- The default Jev trigger moves from **80% to 75%**.
+- The minimum accepted effective reduction drops from **25% to 1%**. Once Jev has safely identified removable result content, even a small useful reduction is committed instead of discarded.
+- Active-run `drop_result` no longer preserves an arbitrary prefix of the old output. The tool call stays visible, while the result becomes an explicit marker telling the model to re-run the tool before relying on its output.
+- Re-evaluation is driven by **new eligible tool-result tokens since the last successful Jev evaluation**, not merely by another tool call appearing:
+  - 75–80%: require about **2,000** new result tokens.
+  - 80–84%: require about **1,000** new result tokens.
+  - >=84%: any meaningful new eligible result output can trigger another pass.
+- A failed Jev request does not advance the evaluation baseline, so the existing retry/backoff path can retry the same work.
+- A successful but <1% pass does advance the baseline, preventing wasteful re-scoring of the same old results every turn.
+- Pi native threshold requests are still delayed only while Jev is healthy, with **87.5%** as the default native fallback.
+
+For a 65,536-token model the intended flow is approximately:
+
+```text
+0–75%       normal agent work
+75–80%      first Jev pass; later passes after ~2k new result tokens
+80–84%      later passes after ~1k new result tokens
+84–87.5%    re-run when any meaningful new eligible result appears
+>=87.5%     Pi native compaction fallback if logical context is still large
+overflow    Pi overflow recovery remains the final safety net
+```
+
 ## 0.4.0: turn-end result-only compaction
 
 0.4.0 changes the Pi lifecycle to protect active coding work on small local context windows.
@@ -99,7 +125,9 @@ export TYPESAFE_API_KEY="..."
 ## Recommended starting configuration
 
 ```bash
-export PI_JEV_COMPACT_AT_PERCENT=80
+export PI_JEV_COMPACT_AT_PERCENT=75
+export PI_JEV_REEVALUATE_MID_PERCENT=80
+export PI_JEV_REEVALUATE_URGENT_PERCENT=84
 export PI_JEV_NATIVE_FALLBACK_PERCENT=87.5
 export PI_JEV_REQUEST_TIMEOUT_MS=8000
 export PI_JEV_EVALUATION_TIMEOUT_MS=12000
@@ -110,14 +138,18 @@ export PI_JEV_DIAGNOSTICS=1
 
 | Variable | Default | Meaning |
 | --- | ---: | --- |
-| `PI_JEV_COMPACT_AT_PERCENT` | `80` | Evaluate Jev at `turn_end` when effective context reaches this percentage; committed pruning keeps applying below it |
+| `PI_JEV_COMPACT_AT_PERCENT` | `75` | Run the first pressure-triggered Jev evaluation at `turn_end` once effective context reaches this percentage |
+| `PI_JEV_REEVALUATE_MID_PERCENT` | `80` | At or above this pressure, lower the new-result threshold for another Jev pass |
+| `PI_JEV_REEVALUATE_URGENT_PERCENT` | `84` | At or above this pressure, re-evaluate whenever meaningful new eligible result output appears |
+| `PI_JEV_REEVALUATE_LOW_RESULT_TOKENS` | `2000` | New eligible tool-result tokens required for another pass between the trigger and mid-pressure thresholds |
+| `PI_JEV_REEVALUATE_MID_RESULT_TOKENS` | `1000` | New eligible tool-result tokens required between the mid and urgent thresholds |
+| `PI_JEV_REEVALUATE_URGENT_RESULT_TOKENS` | `1` | New eligible result tokens required at urgent pressure |
 | `PI_JEV_NATIVE_FALLBACK_PERCENT` | `87.5` | Delay Pi threshold compaction to this logical-context percentage while Jev is healthy; overflow recovery is unaffected |
-| `PI_JEV_MIN_REDUCTION_RATIO` | `0.25` | Minimum Jev reduction required to accept and commit a pass; smaller passes are discarded, matching upstream semantics |
+| `PI_JEV_MIN_REDUCTION_RATIO` | `0.01` | Minimum effective reduction required to commit a pass; 1% avoids accepting effectively zero-change passes |
 | `PI_JEV_KEEP_THRESHOLD` | `0.5` | Jev keep-probability threshold |
 | `PI_JEV_PRESERVE_RECENT_MESSAGES` | `6` | Newest messages in the **logical** transcript protected from pruning |
 | `PI_JEV_MAX_STATE_TOKENS` | `25000` | Jev state budget |
 | `PI_JEV_MAX_REQUEST_TOKENS` | `30000` | Jev request budget |
-| `PI_JEV_TRUNCATE_HEAD_CHARS` | `300` | Prefix retained when `drop_result` truncates a tool result |
 | `PI_JEV_MODEL` | `jev-latest` | TypeSafe Jev model |
 | `PI_JEV_BASE_URL` | upstream default | Override TypeSafe System One endpoint |
 | `PI_JEV_GOAL` | recent user prompts | Fixed goal override sent to Jev |
@@ -145,7 +177,7 @@ export PI_JEV_DIAGNOSTICS=1
 Example fields:
 
 ```text
-context: Pi≈52.8k / 65.5k (80.6%) · Jev trigger=80% · native fallback=87.5%
+context: Pi≈49.8k / 65.5k (76.0%) · Jev trigger=75% · adaptive=80%/84% · native fallback=87.5%
 logical history≈41.2k / 65.5k (62.9%) · calls=18; this is what the model and next Jev pass see
 persisted Pi transcript≈56.0k / 65.5k (85.4%) · calls=31; diagnostic only
 committed decisions: 20 total · drop_call=0 · drop_result=18 · keep=2 · deferred drop_call=11 · restored=0
@@ -176,7 +208,7 @@ At a clean `agent_end`, deferred full deletions may be promoted without another 
 The vendored algorithm follows `fast-jev-compaction` 0.3.0:
 
 - `keepResult >= threshold` -> keep call + full result.
-- otherwise `keepCall >= threshold` -> keep call + truncated result.
+- otherwise `keepCall >= threshold` -> upstream scores this as `drop_result`; the Pi adapter keeps the call and replaces the result with an explicit pruned marker during an active run.
 - otherwise -> remove call + result.
 
-The vendored scoring algorithm is unchanged. The Pi adapter intentionally constrains upstream `drop_call` to `drop_result` during an active agent run and defers the full deletion until clean `agent_end`. See `THIRD_PARTY_LICENSES.md` for the MIT license notice.
+The vendored scoring algorithm is unchanged. The Pi adapter intentionally constrains upstream `drop_call` to `drop_result` during an active agent run, replaces pruned result contents with an explicit re-run marker, and defers full call deletion until clean `agent_end`. See `THIRD_PARTY_LICENSES.md` for the MIT license notice.
