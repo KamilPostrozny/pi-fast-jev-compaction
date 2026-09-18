@@ -43,7 +43,6 @@ export interface Config {
   retryDelayMs: number;
   circuitBreakerFailures: number;
   circuitBreakerMs: number;
-  successfulPassFreshMs: number;
   diagnostics: boolean;
   diagnosticsFile?: string;
   diagnosticsStderr: boolean;
@@ -63,7 +62,6 @@ const DEFAULTS: Config = {
   retryDelayMs: 30_000,
   circuitBreakerFailures: 2,
   circuitBreakerMs: 120_000,
-  successfulPassFreshMs: 300_000,
   diagnostics: true,
   diagnosticsStderr: false,
 };
@@ -221,10 +219,6 @@ export function resolveConfig(): Config {
     circuitBreakerMs: Math.max(
       1_000,
       Math.floor(envNumber("PI_JEV_CIRCUIT_BREAKER_MS", DEFAULTS.circuitBreakerMs)),
-    ),
-    successfulPassFreshMs: Math.max(
-      1_000,
-      Math.floor(envNumber("PI_JEV_SUCCESS_FRESH_MS", DEFAULTS.successfulPassFreshMs)),
     ),
     diagnostics: envBoolean("PI_JEV_DIAGNOSTICS", DEFAULTS.diagnostics),
     diagnosticsStderr: envBoolean("PI_JEV_DIAGNOSTICS_STDERR", DEFAULTS.diagnosticsStderr),
@@ -929,7 +923,7 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
   };
 
   diagnostics.record("extension_loaded", {
-    version: "0.3.0",
+    version: "0.3.1",
     compactAtPercent: config.compactAtPercent,
     requestTimeoutMs: config.requestTimeoutMs,
     evaluationTimeoutMs: config.evaluationTimeoutMs,
