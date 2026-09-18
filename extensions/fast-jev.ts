@@ -206,20 +206,22 @@ export function resolveConfig(): Config {
     Math.floor(envNumber("PI_JEV_EVALUATION_TIMEOUT_MS", DEFAULTS.evaluationTimeoutMs)),
   );
   const compactAtPercent = envNumber("PI_JEV_COMPACT_AT_PERCENT", DEFAULTS.compactAtPercent);
+  const reevaluateMidPercent = Math.max(
+    compactAtPercent,
+    envNumber("PI_JEV_REEVALUATE_MID_PERCENT", DEFAULTS.reevaluateMidPercent),
+  );
+  const reevaluateUrgentPercent = Math.max(
+    reevaluateMidPercent,
+    envNumber("PI_JEV_REEVALUATE_URGENT_PERCENT", DEFAULTS.reevaluateUrgentPercent),
+  );
   const config: Config = {
     compactAtPercent,
     nativeFallbackPercent: Math.max(
-      compactAtPercent,
+      reevaluateUrgentPercent,
       envNumber("PI_JEV_NATIVE_FALLBACK_PERCENT", DEFAULTS.nativeFallbackPercent),
     ),
-    reevaluateMidPercent: Math.max(
-      compactAtPercent,
-      envNumber("PI_JEV_REEVALUATE_MID_PERCENT", DEFAULTS.reevaluateMidPercent),
-    ),
-    reevaluateUrgentPercent: Math.max(
-      compactAtPercent,
-      envNumber("PI_JEV_REEVALUATE_URGENT_PERCENT", DEFAULTS.reevaluateUrgentPercent),
-    ),
+    reevaluateMidPercent,
+    reevaluateUrgentPercent,
     reevaluateLowResultTokens: Math.max(
       1,
       Math.floor(envNumber("PI_JEV_REEVALUATE_LOW_RESULT_TOKENS", DEFAULTS.reevaluateLowResultTokens)),
@@ -1657,11 +1659,12 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
       : `unknown${rawWindow}`;
     const lines = [
       `fast-jev-compaction: enabled=${state.enabled} · at-threshold=${state.active} · evaluating=${state.evaluating}`,
-      `context: Pi≈${piContext} · Jev trigger=${config.compactAtPercent}% · native fallback=${config.nativeFallbackPercent}%`,
+      `context: Pi≈${piContext} · Jev trigger=${config.compactAtPercent}% · adaptive=${config.reevaluateMidPercent}%/${config.reevaluateUrgentPercent}% · native fallback=${config.nativeFallbackPercent}%`,
       `logical history≈${logicalContext} · calls=${state.lastLogicalToolCalls ?? "n/a"}; this is what the model and next Jev pass see`,
       `persisted Pi transcript≈${formatTokens(state.lastRawTokens ?? 0)}${rawWindow} (${(state.lastRawPercent ?? 0).toFixed(1)}%) · calls=${state.lastGrossToolCalls ?? "n/a"}; diagnostic only`,
       `committed decisions: ${state.decisions.size} total · drop_call=${committedDropCalls} · drop_result=${committedDropResults} · keep=${committedKeeps} · deferred drop_call=${state.deferredDropCalls.size} · restored=${state.restoredDecisionCount}`,
       `evaluations: ${state.evaluationSuccesses}/${state.evaluationAttempts} successful · Jev HTTP requests=${state.totalHttpRequests} total${state.lastEvaluationRequests !== undefined ? ` (last pass=${state.lastEvaluationRequests})` : ""}`,
+      `reevaluation: new result≈${formatTokens(state.lastNewEligibleResultTokens ?? 0)} tokens · required=${state.lastRequiredNewResultTokens === null || state.lastRequiredNewResultTokens === undefined ? "n/a" : formatTokens(state.lastRequiredNewResultTokens)} · baseline calls=${state.lastEvaluatedEligibleIds.size}`,
       result
         ? `last pass: mode=${state.lastEvaluationMode ?? "n/a"} · effective reduction=${state.lastEffectiveReduction === undefined ? "n/a" : percent(state.lastEffectiveReduction)} · upstream=${percent(reductionRatio(result))} · eligible=${state.lastEvaluationEligible ?? "n/a"} · ${state.lastEvaluationMs ?? "n/a"}ms · Jev state≈${formatTokens(result.stats.stateTokens)} (${result.stats.stateStage || "n/a"})`
         : "last pass: n/a",
