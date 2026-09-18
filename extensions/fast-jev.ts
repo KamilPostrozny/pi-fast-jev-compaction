@@ -158,7 +158,7 @@ interface RuntimeState {
   lastProviderDurationMs?: number;
   lastProviderStatus?: number;
   deferredDropCalls: Map<string, CachedDecision>;
-  lastEvaluationMode?: "active_result_only" | "agent_end_promote";
+  lastEvaluationMode?: "active_result_only";
   lastEffectiveReduction?: number;
   pendingReductionTokens: number;
 }
@@ -1731,7 +1731,6 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
       state.lastLogicalPercent =
         contextWindow && contextWindow > 0 ? (afterTokens / contextWindow) * 100 : undefined;
       persistLogicalState(pi, diagnostics, state, "agent_end_promote_drop_calls");
-      state.lastEvaluationMode = "agent_end_promote";
     }
 
     diagnostics.record("agent_end", {
