@@ -1,10 +1,7 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import {
-  buildSessionContext,
-  createFileOps,
-  extractFileOpsFromMessage,
-  type ExtensionAPI,
-  type ExtensionContext,
+import type {
+  ExtensionAPI,
+  ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import {
   collectToolCalls,
@@ -19,8 +16,9 @@ import {
 import { Diagnostics, summarizeDiagnostic } from "./diagnostics.ts";
 import {
   acceptsReduction,
-  hasNativeHeadroom,
-  shouldRefreshSettledEligible,
+  activeRunAction,
+  shouldDelayNativeThreshold,
+  shouldEvaluateAtTurnEnd,
 } from "./policy.ts";
 
 const STATUS_KEY = "fast-jev";
@@ -29,6 +27,7 @@ const STATE_SCHEMA_VERSION = 1;
 
 export interface Config {
   compactAtPercent: number;
+  nativeFallbackPercent: number;
   minReductionRatio: number;
   keepThreshold: number;
   preserveRecentMessages: number;
@@ -49,7 +48,8 @@ export interface Config {
 }
 
 const DEFAULTS: Config = {
-  compactAtPercent: 60,
+  compactAtPercent: 80,
+  nativeFallbackPercent: 87.5,
   minReductionRatio: 0.25,
   keepThreshold: 0.5,
   preserveRecentMessages: 6,
@@ -158,8 +158,9 @@ interface RuntimeState {
   lastProviderRequestMs?: number;
   lastProviderDurationMs?: number;
   lastProviderStatus?: number;
-  settledGeneration: number;
-  lastEvaluatedSettledGeneration: number;
+  deferredDropCalls: Map<string, CachedDecision>;
+  lastEvaluationMode?: "active_result_only" | "agent_end_promote";
+  lastEffectiveReduction?: number;
 }
 
 function envNumber(name: string, fallback: number): number {
@@ -191,8 +192,13 @@ export function resolveConfig(): Config {
     requestTimeoutMs + 1_000,
     Math.floor(envNumber("PI_JEV_EVALUATION_TIMEOUT_MS", DEFAULTS.evaluationTimeoutMs)),
   );
+  const compactAtPercent = envNumber("PI_JEV_COMPACT_AT_PERCENT", DEFAULTS.compactAtPercent);
   const config: Config = {
-    compactAtPercent: envNumber("PI_JEV_COMPACT_AT_PERCENT", DEFAULTS.compactAtPercent),
+    compactAtPercent,
+    nativeFallbackPercent: Math.max(
+      compactAtPercent,
+      envNumber("PI_JEV_NATIVE_FALLBACK_PERCENT", DEFAULTS.nativeFallbackPercent),
+    ),
     minReductionRatio: envNumber("PI_JEV_MIN_REDUCTION_RATIO", DEFAULTS.minReductionRatio),
     keepThreshold: envNumber("PI_JEV_KEEP_THRESHOLD", DEFAULTS.keepThreshold),
     preserveRecentMessages: Math.max(
@@ -918,13 +924,13 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
     totalHttpErrors: 0,
     totalHttpTimeouts: 0,
     providerRequestCount: 0,
-    settledGeneration: 0,
-    lastEvaluatedSettledGeneration: -1,
+    deferredDropCalls: new Map(),
   };
 
   diagnostics.record("extension_loaded", {
-    version: "0.3.1",
+    version: "0.4.0",
     compactAtPercent: config.compactAtPercent,
+    nativeFallbackPercent: config.nativeFallbackPercent,
     requestTimeoutMs: config.requestTimeoutMs,
     evaluationTimeoutMs: config.evaluationTimeoutMs,
     circuitBreakerFailures: config.circuitBreakerFailures,
