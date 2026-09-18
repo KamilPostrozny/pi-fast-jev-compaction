@@ -136,7 +136,6 @@ interface RuntimeState {
   retryAfterMs: number;
   consecutiveFailures: number;
   breakerUntilMs: number;
-  lastSuccessMs: number;
   lastEvaluationMs?: number;
   lastHttp?: HttpSnapshot;
   lastApply?: ApplyStats;
@@ -609,15 +608,17 @@ function restoreLogicalState(
   }
 
   state.decisions = restored;
+  state.deferredDropCalls.clear();
   state.restoredDecisionCount = restored.size;
   state.lastResult = undefined;
+  state.lastEffectiveReduction = undefined;
+  state.lastEvaluationMode = undefined;
   state.lastError = undefined;
   state.insufficient = false;
   state.forceRefresh = false;
   state.retryAfterMs = 0;
   state.consecutiveFailures = 0;
   state.breakerUntilMs = 0;
-  state.lastSuccessMs = 0;
   diagnostics.record("logical_state_restored", {
     decisions: restored.size,
     savedAt: saved?.savedAt,
@@ -967,11 +968,24 @@ function logicalContextAtCompaction(
   ).messages;
   const projection = projectMessages(logical);
   const tokens = rawTokenEstimate(projection.messages, ctx);
-  const contextWindow = ctx.getContextUsage()?.contextWindow ?? ctx.model?.contextWindow;
+  const usage = ctx.getContextUsage();
+  const contextWindow = usage?.contextWindow ?? ctx.model?.contextWindow;
+  const estimatedPercent =
+    contextWindow && contextWindow > 0 ? (tokens / contextWindow) * 100 : null;
+  // Provider usage is the best calibration we have for Pi's real request size.
+  // It may slightly overstate the context immediately after a fresh Jev pass,
+  // which is intentionally conservative for deciding whether to allow native
+  // compaction.
+  const percent =
+    usage?.percent === null || usage?.percent === undefined
+      ? estimatedPercent
+      : estimatedPercent === null
+        ? usage.percent
+        : Math.max(usage.percent, estimatedPercent);
   return {
     tokens,
     messages: logical.length,
-    percent: contextWindow && contextWindow > 0 ? (tokens / contextWindow) * 100 : null,
+    percent,
   };
 }
 
@@ -1177,7 +1191,6 @@ async function evaluateAtTurnEnd(
     state.insufficient = !accepted;
     state.consecutiveFailures = 0;
     state.breakerUntilMs = 0;
-    state.lastSuccessMs = accepted ? Date.now() : state.lastSuccessMs;
     state.lastEvaluationMs = evaluation.durationMs;
     state.lastEvaluationRequests = evaluation.result.stats.requests;
     state.evaluationSuccesses += 1;
@@ -1250,7 +1263,6 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
     retryAfterMs: 0,
     consecutiveFailures: 0,
     breakerUntilMs: 0,
-    lastSuccessMs: 0,
     restoredDecisionCount: 0,
     contextHookCount: 0,
     failOpenCount: 0,
@@ -1498,7 +1510,6 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
     state.insufficient = false;
     state.lastError = undefined;
     state.lastResult = undefined;
-    state.lastSuccessMs = 0;
     state.restoredDecisionCount = 0;
     persistLogicalState(pi, diagnostics, state, "native_compaction_tail");
     diagnostics.record("session_compact", {
