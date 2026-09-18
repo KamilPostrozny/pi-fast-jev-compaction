@@ -17,6 +17,7 @@ import { Diagnostics, summarizeDiagnostic } from "./diagnostics.ts";
 import {
   acceptsReduction,
   activeRunAction,
+  calibratedPressurePercent,
   requiredNewResultTokens,
   shouldDelayNativeThreshold,
   shouldEvaluateAtTurnEnd,
@@ -32,9 +33,9 @@ export interface Config {
   nativeFallbackPercent: number;
   reevaluateMidPercent: number;
   reevaluateUrgentPercent: number;
-  reevaluateLowResultTokens: number;
-  reevaluateMidResultTokens: number;
-  reevaluateUrgentResultTokens: number;
+  reevaluateLowResultPercent: number;
+  reevaluateMidResultPercent: number;
+  reevaluateUrgentResultPercent: number;
   minReductionRatio: number;
   keepThreshold: number;
   preserveRecentMessages: number;
@@ -58,9 +59,9 @@ const DEFAULTS: Config = {
   nativeFallbackPercent: 87.5,
   reevaluateMidPercent: 80,
   reevaluateUrgentPercent: 84,
-  reevaluateLowResultTokens: 2_000,
-  reevaluateMidResultTokens: 1_000,
-  reevaluateUrgentResultTokens: 1,
+  reevaluateLowResultPercent: 3,
+  reevaluateMidResultPercent: 1.5,
+  reevaluateUrgentResultPercent: 0,
   minReductionRatio: 0.01,
   keepThreshold: 0.5,
   preserveRecentMessages: 6,
@@ -138,6 +139,7 @@ interface RuntimeState {
   lastPiPercent?: number;
   lastLogicalTokens?: number;
   lastLogicalPercent?: number;
+  lastPressurePercent?: number;
   lastGrossToolCalls?: number;
   lastLogicalToolCalls?: number;
   restoredDecisionCount: number;
@@ -222,17 +224,17 @@ export function resolveConfig(): Config {
     ),
     reevaluateMidPercent,
     reevaluateUrgentPercent,
-    reevaluateLowResultTokens: Math.max(
-      1,
-      Math.floor(envNumber("PI_JEV_REEVALUATE_LOW_RESULT_TOKENS", DEFAULTS.reevaluateLowResultTokens)),
+    reevaluateLowResultPercent: Math.max(
+      0,
+      envNumber("PI_JEV_REEVALUATE_LOW_RESULT_PERCENT", DEFAULTS.reevaluateLowResultPercent),
     ),
-    reevaluateMidResultTokens: Math.max(
-      1,
-      Math.floor(envNumber("PI_JEV_REEVALUATE_MID_RESULT_TOKENS", DEFAULTS.reevaluateMidResultTokens)),
+    reevaluateMidResultPercent: Math.max(
+      0,
+      envNumber("PI_JEV_REEVALUATE_MID_RESULT_PERCENT", DEFAULTS.reevaluateMidResultPercent),
     ),
-    reevaluateUrgentResultTokens: Math.max(
-      1,
-      Math.floor(envNumber("PI_JEV_REEVALUATE_URGENT_RESULT_TOKENS", DEFAULTS.reevaluateUrgentResultTokens)),
+    reevaluateUrgentResultPercent: Math.max(
+      0,
+      envNumber("PI_JEV_REEVALUATE_URGENT_RESULT_PERCENT", DEFAULTS.reevaluateUrgentResultPercent),
     ),
     minReductionRatio: envNumber("PI_JEV_MIN_REDUCTION_RATIO", DEFAULTS.minReductionRatio),
     keepThreshold: envNumber("PI_JEV_KEEP_THRESHOLD", DEFAULTS.keepThreshold),
