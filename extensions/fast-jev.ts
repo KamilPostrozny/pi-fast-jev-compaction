@@ -160,6 +160,7 @@ interface RuntimeState {
   deferredDropCalls: Map<string, CachedDecision>;
   lastEvaluationMode?: "active_result_only" | "agent_end_promote";
   lastEffectiveReduction?: number;
+  pendingReductionTokens: number;
 }
 
 function envNumber(name: string, fallback: number): number {
@@ -613,6 +614,7 @@ function restoreLogicalState(
   state.lastResult = undefined;
   state.lastEffectiveReduction = undefined;
   state.lastEvaluationMode = undefined;
+  state.pendingReductionTokens = 0;
   state.lastError = undefined;
   state.insufficient = false;
   state.forceRefresh = false;
@@ -972,16 +974,21 @@ function logicalContextAtCompaction(
   const contextWindow = usage?.contextWindow ?? ctx.model?.contextWindow;
   const estimatedPercent =
     contextWindow && contextWindow > 0 ? (tokens / contextWindow) * 100 : null;
-  // Provider usage is the best calibration we have for Pi's real request size.
-  // It may slightly overstate the context immediately after a fresh Jev pass,
-  // which is intentionally conservative for deciding whether to allow native
-  // compaction.
+  const adjustedUsagePercent =
+    usage?.tokens !== null &&
+    usage?.tokens !== undefined &&
+    contextWindow &&
+    contextWindow > 0
+      ? (Math.max(0, usage.tokens - state.pendingReductionTokens) / contextWindow) * 100
+      : usage?.percent ?? null;
+  // Calibrate the local estimate against Pi's provider-backed usage while
+  // subtracting only pruning committed after that usage measurement.
   const percent =
-    usage?.percent === null || usage?.percent === undefined
+    adjustedUsagePercent === null || adjustedUsagePercent === undefined
       ? estimatedPercent
       : estimatedPercent === null
-        ? usage.percent
-        : Math.max(usage.percent, estimatedPercent);
+        ? adjustedUsagePercent
+        : Math.max(adjustedUsagePercent, estimatedPercent);
   return {
     tokens,
     messages: logical.length,
@@ -1204,6 +1211,7 @@ async function evaluateAtTurnEnd(
       );
       const postProjection = projectMessages(applied.messages);
       const postTokens = rawTokenEstimate(postProjection.messages, ctx);
+      state.pendingReductionTokens = Math.max(0, logicalTokens - postTokens);
       state.lastLogicalTokens = postTokens;
       state.lastLogicalPercent =
         contextWindow && contextWindow > 0 ? (postTokens / contextWindow) * 100 : undefined;
@@ -1275,6 +1283,7 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
     totalHttpTimeouts: 0,
     providerRequestCount: 0,
     deferredDropCalls: new Map(),
+    pendingReductionTokens: 0,
   };
 
   diagnostics.record("extension_loaded", {
@@ -1510,6 +1519,7 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
     state.insufficient = false;
     state.lastError = undefined;
     state.lastResult = undefined;
+    state.pendingReductionTokens = 0;
     state.restoredDecisionCount = 0;
     persistLogicalState(pi, diagnostics, state, "native_compaction_tail");
     diagnostics.record("session_compact", {
@@ -1604,6 +1614,10 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
   });
 
   pi.on("after_provider_response", (event) => {
+    // The provider response now carries usage for a request that already saw
+    // all decisions committed before this turn, so no pending correction from
+    // the previous turn is needed anymore.
+    state.pendingReductionTokens = 0;
     const durationMs = state.lastProviderRequestMs ? Date.now() - state.lastProviderRequestMs : undefined;
     state.lastProviderDurationMs = durationMs;
     state.lastProviderStatus = event.status;
