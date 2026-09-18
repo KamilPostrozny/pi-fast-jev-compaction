@@ -688,9 +688,9 @@ function evaluationPolicy(config: Config): TurnEndEvaluationPolicy {
     triggerPercent: config.compactAtPercent,
     midPercent: config.reevaluateMidPercent,
     urgentPercent: config.reevaluateUrgentPercent,
-    lowPressureResultTokens: config.reevaluateLowResultTokens,
-    midPressureResultTokens: config.reevaluateMidResultTokens,
-    urgentResultTokens: config.reevaluateUrgentResultTokens,
+    lowPressureResultPercent: config.reevaluateLowResultPercent,
+    midPressureResultPercent: config.reevaluateMidResultPercent,
+    urgentResultPercent: config.reevaluateUrgentResultPercent,
   };
 }
 
