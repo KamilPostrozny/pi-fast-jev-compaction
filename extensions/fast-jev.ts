@@ -17,8 +17,10 @@ import { Diagnostics, summarizeDiagnostic } from "./diagnostics.ts";
 import {
   acceptsReduction,
   activeRunAction,
+  requiredNewResultTokens,
   shouldDelayNativeThreshold,
   shouldEvaluateAtTurnEnd,
+  type TurnEndEvaluationPolicy,
 } from "./policy.ts";
 
 const STATUS_KEY = "fast-jev";
@@ -28,12 +30,16 @@ const STATE_SCHEMA_VERSION = 1;
 export interface Config {
   compactAtPercent: number;
   nativeFallbackPercent: number;
+  reevaluateMidPercent: number;
+  reevaluateUrgentPercent: number;
+  reevaluateLowResultTokens: number;
+  reevaluateMidResultTokens: number;
+  reevaluateUrgentResultTokens: number;
   minReductionRatio: number;
   keepThreshold: number;
   preserveRecentMessages: number;
   maxStateTokens: number;
   maxRequestTokens: number;
-  truncateHeadChars: number;
   model: string;
   baseUrl?: string;
   goal?: string;
@@ -48,14 +54,18 @@ export interface Config {
 }
 
 const DEFAULTS: Config = {
-  compactAtPercent: 80,
+  compactAtPercent: 75,
   nativeFallbackPercent: 87.5,
-  minReductionRatio: 0.25,
+  reevaluateMidPercent: 80,
+  reevaluateUrgentPercent: 84,
+  reevaluateLowResultTokens: 2_000,
+  reevaluateMidResultTokens: 1_000,
+  reevaluateUrgentResultTokens: 1,
+  minReductionRatio: 0.01,
   keepThreshold: 0.5,
   preserveRecentMessages: 6,
   maxStateTokens: 25_000,
   maxRequestTokens: 30_000,
-  truncateHeadChars: 300,
   model: "jev-latest",
   requestTimeoutMs: 8_000,
   evaluationTimeoutMs: 12_000,
@@ -98,7 +108,7 @@ interface Evaluation {
 interface ApplyStats {
   droppedCalls: number;
   droppedResults: number;
-  truncatedResults: number;
+  prunedResults: number;
   messagesBefore: number;
   messagesAfter: number;
 }
@@ -161,6 +171,9 @@ interface RuntimeState {
   lastEvaluationMode?: "active_result_only";
   lastEffectiveReduction?: number;
   pendingReductionTokens: number;
+  lastEvaluatedEligibleIds: Set<string>;
+  lastNewEligibleResultTokens?: number;
+  lastRequiredNewResultTokens?: number | null;
 }
 
 function envNumber(name: string, fallback: number): number {
@@ -199,6 +212,26 @@ export function resolveConfig(): Config {
       compactAtPercent,
       envNumber("PI_JEV_NATIVE_FALLBACK_PERCENT", DEFAULTS.nativeFallbackPercent),
     ),
+    reevaluateMidPercent: Math.max(
+      compactAtPercent,
+      envNumber("PI_JEV_REEVALUATE_MID_PERCENT", DEFAULTS.reevaluateMidPercent),
+    ),
+    reevaluateUrgentPercent: Math.max(
+      compactAtPercent,
+      envNumber("PI_JEV_REEVALUATE_URGENT_PERCENT", DEFAULTS.reevaluateUrgentPercent),
+    ),
+    reevaluateLowResultTokens: Math.max(
+      1,
+      Math.floor(envNumber("PI_JEV_REEVALUATE_LOW_RESULT_TOKENS", DEFAULTS.reevaluateLowResultTokens)),
+    ),
+    reevaluateMidResultTokens: Math.max(
+      1,
+      Math.floor(envNumber("PI_JEV_REEVALUATE_MID_RESULT_TOKENS", DEFAULTS.reevaluateMidResultTokens)),
+    ),
+    reevaluateUrgentResultTokens: Math.max(
+      1,
+      Math.floor(envNumber("PI_JEV_REEVALUATE_URGENT_RESULT_TOKENS", DEFAULTS.reevaluateUrgentResultTokens)),
+    ),
     minReductionRatio: envNumber("PI_JEV_MIN_REDUCTION_RATIO", DEFAULTS.minReductionRatio),
     keepThreshold: envNumber("PI_JEV_KEEP_THRESHOLD", DEFAULTS.keepThreshold),
     preserveRecentMessages: Math.max(
@@ -207,10 +240,6 @@ export function resolveConfig(): Config {
     ),
     maxStateTokens: Math.max(1, envNumber("PI_JEV_MAX_STATE_TOKENS", DEFAULTS.maxStateTokens)),
     maxRequestTokens: Math.max(1, envNumber("PI_JEV_MAX_REQUEST_TOKENS", DEFAULTS.maxRequestTokens)),
-    truncateHeadChars: Math.max(
-      0,
-      Math.floor(envNumber("PI_JEV_TRUNCATE_HEAD_CHARS", DEFAULTS.truncateHeadChars)),
-    ),
     model: envString("PI_JEV_MODEL") ?? DEFAULTS.model,
     requestTimeoutMs,
     evaluationTimeoutMs,
@@ -374,24 +403,22 @@ function formatTokens(value: number): string {
   return `${Math.round(value / 1000)}k`;
 }
 
-function truncateResultText(text: string, isError: boolean, headChars: number): string {
-  if (text.length <= headChars + 120) return text;
-  const head = headChars > 0 ? `${text.slice(0, headChars)}\n` : "";
-  return `${head}[fast-jev-compaction truncated ${text.length - headChars} chars of this tool result${
-    isError ? " (error)" : ""
-  }; re-run the tool if needed]`;
+function prunedResultText(text: string, isError: boolean): string {
+  const marker =
+    `[fast-jev-compaction: result pruned${isError ? " (error)" : ""}; re-run this tool before relying on its output]`;
+  // Do not make tiny results larger just to say they were pruned.
+  return text.length <= marker.length ? text : marker;
 }
 
 function applyDecisionsDetailed(
   messages: readonly AgentMessage[],
   decisions: ReadonlyMap<string, CachedDecision>,
   eligibleIds: ReadonlySet<string>,
-  truncateHeadChars: number,
 ): { messages: AgentMessage[]; stats: ApplyStats } {
   const output: AgentMessage[] = [];
   let droppedCalls = 0;
   let droppedResults = 0;
-  let truncatedResults = 0;
+  let prunedResults = 0;
 
   for (const message of messages) {
     if (message.role === "assistant") {
@@ -420,12 +447,12 @@ function applyDecisionsDetailed(
       }
       if (decision?.action === "drop_result") {
         const original = textContent(message.content);
-        const truncated = truncateResultText(original, message.isError, truncateHeadChars);
-        if (truncated !== original) {
-          truncatedResults += 1;
+        const pruned = prunedResultText(original, message.isError);
+        if (pruned !== original) {
+          prunedResults += 1;
           output.push({
             ...message,
-            content: [{ type: "text", text: truncated }],
+            content: [{ type: "text", text: pruned }],
           });
           continue;
         }
@@ -439,7 +466,7 @@ function applyDecisionsDetailed(
     stats: {
       droppedCalls,
       droppedResults,
-      truncatedResults,
+      prunedResults,
       messagesBefore: messages.length,
       messagesAfter: output.length,
     },
@@ -451,9 +478,8 @@ export function applyDecisionsToPi(
   messages: readonly AgentMessage[],
   decisions: ReadonlyMap<string, CachedDecision>,
   eligibleIds: ReadonlySet<string>,
-  truncateHeadChars: number,
 ): AgentMessage[] {
-  return applyDecisionsDetailed(messages, decisions, eligibleIds, truncateHeadChars).messages;
+  return applyDecisionsDetailed(messages, decisions, eligibleIds).messages;
 }
 
 function decisionMap(result: CompactResult, calls: readonly JevToolCall[]): Map<string, CachedDecision> {
@@ -508,14 +534,12 @@ function projectedChars(messages: readonly JevMessage[]): number {
 function activeReductionRatio(
   messages: readonly AgentMessage[],
   decisions: ReadonlyMap<string, CachedDecision>,
-  truncateHeadChars: number,
 ): number {
   const before = projectMessages(messages).messages;
   const afterPi = applyDecisionsDetailed(
     messages,
     decisions,
     decisionIds(decisions),
-    truncateHeadChars,
   ).messages;
   const after = projectMessages(afterPi).messages;
   const charsBefore = projectedChars(before);
@@ -768,7 +792,7 @@ async function evaluate(
       protectedToolUseIds: projected.protectedToolCallIds,
       maxStateTokens: config.maxStateTokens,
       maxRequestTokens: config.maxRequestTokens,
-      truncateHeadChars: config.truncateHeadChars,
+      truncateHeadChars: 0,
       fetch: makeDiagnosticFetch(diagnostics, config, controller.signal, state),
     });
     const hardDeadline = new Promise<never>((_resolve, reject) => {
@@ -1284,12 +1308,19 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
     providerRequestCount: 0,
     deferredDropCalls: new Map(),
     pendingReductionTokens: 0,
+    lastEvaluatedEligibleIds: new Set(),
   };
 
   diagnostics.record("extension_loaded", {
-    version: "0.4.0",
+    version: "0.5.0",
     compactAtPercent: config.compactAtPercent,
     nativeFallbackPercent: config.nativeFallbackPercent,
+    reevaluateMidPercent: config.reevaluateMidPercent,
+    reevaluateUrgentPercent: config.reevaluateUrgentPercent,
+    reevaluateLowResultTokens: config.reevaluateLowResultTokens,
+    reevaluateMidResultTokens: config.reevaluateMidResultTokens,
+    reevaluateUrgentResultTokens: config.reevaluateUrgentResultTokens,
+    minReductionRatio: config.minReductionRatio,
     requestTimeoutMs: config.requestTimeoutMs,
     evaluationTimeoutMs: config.evaluationTimeoutMs,
     circuitBreakerFailures: config.circuitBreakerFailures,
