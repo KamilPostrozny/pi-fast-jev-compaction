@@ -4,6 +4,23 @@ A Pi package port of [`tamaratran/fast-jev-compaction`](https://github.com/tamar
 
 It uses TypeSafe Jev to decide, tool call by tool call, which old calls/results still need to remain in model context. User and assistant prose is not summarized or rewritten by this extension. Pi's persisted session transcript stays intact.
 
+## 0.6.3: restore the 0.5 control behavior
+
+0.6.3 deliberately rolls the active-run behavior back to the known-good 0.5.0 control after the 0.6.x grounding/read-retention experiments caused reconnaissance loops and frequent native compaction.
+
+The current active-run policy is again:
+
+- Jev first evaluates at **75% Pi/provider-reported context usage**.
+- Later evaluations use the original 0.5 gates: about **2000** new eligible result tokens below 80%, **1000** from 80–84%, and any new eligible result at or above 84%.
+- Any accepted pass that frees at least **1%** is committed.
+- A `drop_result` keeps the tool-call breadcrumb and replaces the result with the explicit re-run marker.
+- There is **no recurring grounding message**.
+- There is **no source-read pinning**. If exact source was pruned and the model later needs it, a targeted reread is allowed to happen naturally.
+- Normal Jev scheduling uses Pi/provider usage just as 0.5 did.
+- The **87.5% native fallback** retains the calibrated logical-context safety check so stale Pi usage does not accidentally suppress necessary native compaction.
+
+This release is intentionally a control restoration, not another context-scaling experiment. Once the 0.5 behavior is reconfirmed in fresh sessions, the reevaluation token gates can be scaled by context size in a separate change.
+
 ## 0.6.2: enforce source-read pins
 
 0.6.2 fixes a protection-plumbing bug in 0.6.1.
@@ -186,6 +203,11 @@ export TYPESAFE_API_KEY="..."
 
 ```bash
 export PI_JEV_COMPACT_AT_PERCENT=75
+export PI_JEV_REEVALUATE_MID_PERCENT=80
+export PI_JEV_REEVALUATE_URGENT_PERCENT=84
+export PI_JEV_REEVALUATE_LOW_RESULT_TOKENS=2000
+export PI_JEV_REEVALUATE_MID_RESULT_TOKENS=1000
+export PI_JEV_REEVALUATE_URGENT_RESULT_TOKENS=1
 export PI_JEV_NATIVE_FALLBACK_PERCENT=87.5
 export PI_JEV_REQUEST_TIMEOUT_MS=8000
 export PI_JEV_EVALUATION_TIMEOUT_MS=12000
@@ -196,8 +218,13 @@ export PI_JEV_DIAGNOSTICS=1
 
 | Variable | Default | Meaning |
 | --- | ---: | --- |
-| `PI_JEV_COMPACT_AT_PERCENT` | `75` | Run the first pressure-triggered Jev evaluation at `turn_end` once effective context reaches this percentage |
-| `PI_JEV_NATIVE_FALLBACK_PERCENT` | `87.5` | Delay Pi threshold compaction to this logical-context percentage while Jev is healthy; overflow recovery is unaffected |
+| `PI_JEV_COMPACT_AT_PERCENT` | `75` | Run the first pressure-triggered Jev evaluation at `turn_end` once Pi/provider context reaches this percentage |
+| `PI_JEV_REEVALUATE_MID_PERCENT` | `80` | Above this Pi/provider usage, use the mid-pressure new-result gate |
+| `PI_JEV_REEVALUATE_URGENT_PERCENT` | `84` | Above this Pi/provider usage, use the urgent new-result gate |
+| `PI_JEV_REEVALUATE_LOW_RESULT_TOKENS` | `2000` | New eligible tool-result tokens required for another pass between 75% and 80% |
+| `PI_JEV_REEVALUATE_MID_RESULT_TOKENS` | `1000` | New eligible tool-result tokens required between 80% and 84% |
+| `PI_JEV_REEVALUATE_URGENT_RESULT_TOKENS` | `1` | New eligible result tokens required at or above 84% |
+| `PI_JEV_NATIVE_FALLBACK_PERCENT` | `87.5` | Delay Pi threshold compaction to this calibrated logical-context percentage while Jev is healthy; overflow recovery is unaffected |
 | `PI_JEV_MIN_REDUCTION_RATIO` | `0.01` | Minimum effective reduction required to commit a pass; 1% avoids accepting effectively zero-change passes |
 | `PI_JEV_KEEP_THRESHOLD` | `0.5` | Jev keep-probability threshold |
 | `PI_JEV_PRESERVE_RECENT_MESSAGES` | `6` | Newest messages in the **logical** transcript protected from pruning |
