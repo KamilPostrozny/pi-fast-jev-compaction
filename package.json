@@ -1,7 +1,7 @@
 {
   "name": "pi-fast-jev-compaction",
-  "version": "0.7.1",
-  "description": "Jev pruning for Pi with real-usage pressure episodes and single-attempt native fallback.",
+  "version": "0.7.2",
+  "description": "Jev pruning for Pi with real-usage pressure episodes and 70% re-arm hysteresis.",
   "type": "module",
   "license": "MIT",
   "keywords": [
