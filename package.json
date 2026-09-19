@@ -1,7 +1,7 @@
 {
   "name": "pi-fast-jev-compaction",
-  "version": "0.7.0",
-  "description": "Jev pruning for Pi driven by Pi's real context usage and configured compaction reserve.",
+  "version": "0.7.1",
+  "description": "Jev pruning for Pi with real-usage pressure episodes and single-attempt native fallback.",
   "type": "module",
   "license": "MIT",
   "keywords": [
