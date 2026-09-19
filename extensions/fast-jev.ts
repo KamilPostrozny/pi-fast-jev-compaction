@@ -1209,7 +1209,16 @@ async function evaluateAtTurnEnd(
       logicalBefore,
       activeMaps.committed,
     );
-    const accepted = acceptsReduction(effectiveRatio, config.minReductionRatio);
+    const proposedApply = applyDecisionsDetailed(
+      logicalBefore,
+      activeMaps.committed,
+      decisionIds(activeMaps.committed),
+    );
+    const changedResults =
+      proposedApply.stats.droppedCalls +
+      proposedApply.stats.droppedResults +
+      proposedApply.stats.prunedResults;
+    const accepted = acceptsReduction(changedResults);
     const beforeMerge = new Map(state.decisions);
 
     if (accepted) {
@@ -1226,6 +1235,10 @@ async function evaluateAtTurnEnd(
       }
 
       persistLogicalState(pi, diagnostics, state, "turn_end_result_only");
+      // Pi's usage is still from the request that saw the pre-pruned context.
+      // Give the new logical history one provider request to produce fresh,
+      // authoritative usage before considering native threshold compaction.
+      state.awaitingUsageRefresh = true;
     }
 
     state.lastResult = evaluation.result;
@@ -1248,7 +1261,6 @@ async function evaluateAtTurnEnd(
       );
       const postProjection = projectMessages(applied.messages);
       const postTokens = rawTokenEstimate(postProjection.messages, ctx);
-      state.pendingReductionTokens = Math.max(0, logicalTokens - postTokens);
       state.lastLogicalTokens = postTokens;
       state.lastLogicalPercent =
         contextWindow && contextWindow > 0 ? (postTokens / contextWindow) * 100 : undefined;
@@ -1272,7 +1284,8 @@ async function evaluateAtTurnEnd(
       deferredDropCalls: state.deferredDropCalls.size,
       evaluatedEligibleBaseline: state.lastEvaluatedEligibleIds.size,
       newEligibleResultTokens,
-      requiredNewResultTokens: requiredResultTokens,
+      changedResults,
+      awaitingUsageRefresh: state.awaitingUsageRefresh,
       actions: countActions(evaluation.result),
       accepted,
     });
