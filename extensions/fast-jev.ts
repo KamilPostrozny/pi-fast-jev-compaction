@@ -20,8 +20,10 @@ import {
   acceptsReduction,
   activeRunAction,
   realContextBoundary,
+  reconcilePressureEpisode,
   shouldCancelNativeThreshold,
   shouldEvaluateAtTurnEnd,
+  type PressureEpisodeState,
   type RealContextBoundary,
 } from "./policy.ts";
 
@@ -156,7 +158,8 @@ interface RuntimeState {
   deferredDropCalls: Map<string, CachedDecision>;
   lastEvaluationMode?: "active_result_only";
   lastEffectiveReduction?: number;
-  awaitingUsageRefresh: boolean;
+  pressureEpisode: PressureEpisodeState;
+  usageRefreshReady: boolean;
   lastEvaluatedEligibleIds: Set<string>;
   lastNewEligibleResultTokens?: number;
   lastReserveTokens?: number;
@@ -597,7 +600,8 @@ function restoreLogicalState(
   state.deferredDropCalls.clear();
   state.lastEvaluatedEligibleIds.clear();
   state.lastNewEligibleResultTokens = undefined;
-  state.awaitingUsageRefresh = false;
+  state.pressureEpisode = "armed";
+  state.usageRefreshReady = false;
   state.restoredDecisionCount = restored.size;
   state.lastResult = undefined;
   state.lastEffectiveReduction = undefined;
@@ -1323,13 +1327,14 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
     totalHttpTimeouts: 0,
     providerRequestCount: 0,
     deferredDropCalls: new Map(),
-    awaitingUsageRefresh: false,
+    pressureEpisode: "armed",
+    usageRefreshReady: false,
     lastEvaluatedEligibleIds: new Set(),
   };
 
   diagnostics.record("extension_loaded", {
-    version: "0.7.0",
-    thresholdMode: "pi_real_usage_reserve",
+    version: "0.7.1",
+    thresholdMode: "pi_real_usage_pressure_episode",
     requestTimeoutMs: config.requestTimeoutMs,
     evaluationTimeoutMs: config.evaluationTimeoutMs,
     circuitBreakerFailures: config.circuitBreakerFailures,
