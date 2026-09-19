@@ -1578,10 +1578,9 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
     state.insufficient = false;
     state.lastError = undefined;
     state.lastResult = undefined;
-    state.pendingReductionTokens = 0;
+    state.awaitingUsageRefresh = false;
     state.lastEvaluatedEligibleIds.clear();
     state.lastNewEligibleResultTokens = undefined;
-    state.lastRequiredNewResultTokens = undefined;
     state.restoredDecisionCount = 0;
     persistLogicalState(pi, diagnostics, state, "native_compaction_tail");
     diagnostics.record("session_compact", {
@@ -1640,12 +1639,12 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
       : `unknown${rawWindow}`;
     const lines = [
       `fast-jev-compaction: enabled=${state.enabled} · at-threshold=${state.active} · evaluating=${state.evaluating}`,
-      `context: Pi≈${piContext} · Jev trigger=${config.compactAtPercent}% · adaptive=${config.reevaluateMidPercent}%/${config.reevaluateUrgentPercent}% · native fallback=${config.nativeFallbackPercent}%`,
-      `logical history≈${logicalContext} · calls=${state.lastLogicalToolCalls ?? "n/a"}; this is what the model and next Jev pass see`,
+      `context: Pi≈${piContext} · Pi ceiling=${state.lastCeilingTokens === undefined ? "unknown" : formatTokens(state.lastCeilingTokens)} · reserve=${state.lastReserveTokens === undefined ? "unknown" : formatTokens(state.lastReserveTokens)} · auto-compaction=${state.lastAutoCompactionEnabled ?? "unknown"}`,
+      `logical history estimate≈${logicalContext} · calls=${state.lastLogicalToolCalls ?? "n/a"}; diagnostic/Jev budgeting only, never used for threshold decisions`,
       `persisted Pi transcript≈${formatTokens(state.lastRawTokens ?? 0)}${rawWindow} (${(state.lastRawPercent ?? 0).toFixed(1)}%) · calls=${state.lastGrossToolCalls ?? "n/a"}; diagnostic only`,
       `committed decisions: ${state.decisions.size} total · drop_call=${committedDropCalls} · drop_result=${committedDropResults} · keep=${committedKeeps} · deferred drop_call=${state.deferredDropCalls.size} · restored=${state.restoredDecisionCount}`,
       `evaluations: ${state.evaluationSuccesses}/${state.evaluationAttempts} successful · Jev HTTP requests=${state.totalHttpRequests} total${state.lastEvaluationRequests !== undefined ? ` (last pass=${state.lastEvaluationRequests})` : ""}`,
-      `reevaluation: new result≈${formatTokens(state.lastNewEligibleResultTokens ?? 0)} tokens · required=${state.lastRequiredNewResultTokens === null || state.lastRequiredNewResultTokens === undefined ? "n/a" : formatTokens(state.lastRequiredNewResultTokens)} · baseline calls=${state.lastEvaluatedEligibleIds.size}`,
+      `reevaluation: new eligible result≈${formatTokens(state.lastNewEligibleResultTokens ?? 0)} tokens · baseline calls=${state.lastEvaluatedEligibleIds.size} · awaiting real usage refresh=${state.awaitingUsageRefresh}`,
       result
         ? `last pass: mode=${state.lastEvaluationMode ?? "n/a"} · effective reduction=${state.lastEffectiveReduction === undefined ? "n/a" : percent(state.lastEffectiveReduction)} · upstream=${percent(reductionRatio(result))} · eligible=${state.lastEvaluationEligible ?? "n/a"} · ${state.lastEvaluationMs ?? "n/a"}ms · Jev state≈${formatTokens(result.stats.stateTokens)} (${result.stats.stateStage || "n/a"})`
         : "last pass: n/a",
@@ -1672,24 +1671,26 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
       jevActive: state.active,
       jevError: state.lastError,
       committed: state.decisions.size,
+      awaitingUsageRefresh: state.awaitingUsageRefresh,
       lastApply: state.lastApply,
     });
   });
 
   pi.on("after_provider_response", (event) => {
-    // The provider response now carries usage for a request that already saw
-    // all decisions committed before this turn, so no pending correction from
-    // the previous turn is needed anymore.
-    state.pendingReductionTokens = 0;
     const durationMs = state.lastProviderRequestMs ? Date.now() - state.lastProviderRequestMs : undefined;
     state.lastProviderDurationMs = durationMs;
     state.lastProviderStatus = event.status;
+    const refreshedUsage =
+      typeof event.status === "number" && event.status >= 200 && event.status < 300;
+    if (refreshedUsage) state.awaitingUsageRefresh = false;
     diagnostics.record("provider_response", {
       requestId: state.providerRequestCount,
       status: event.status,
       durationMs,
       contextHookId: state.lastContextHookId,
       contextOutcome: state.lastContextOutcome,
+      refreshedUsage,
+      awaitingUsageRefresh: state.awaitingUsageRefresh,
     });
   });
 
