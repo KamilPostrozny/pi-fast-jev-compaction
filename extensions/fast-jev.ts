@@ -1482,48 +1482,35 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
 
   pi.on("session_before_compact", (event, ctx) => {
     try {
-      const hasKey = Boolean(process.env.TYPESAFE_API_KEY?.trim());
-      const remoteHealthy =
-        !breakerActive(state) &&
-        !state.lastError;
-      const logicalGuardAvailable = canGuardNativeThreshold({
-        enabled: state.enabled,
-        hasKey,
-        remoteHealthy,
-        committedDecisions: state.decisions.size,
-      });
-
-      const logical = logicalContextAtCompaction(
-        ctx,
-        state,
-      );
-
-      if (
+      const piBoundary = piCompactionBoundary(ctx);
+      const boundary = piBoundary.boundary;
+      const cancelThreshold =
         event.reason === "threshold" &&
-        shouldDelayNativeThreshold(
-          logical.percent,
-          config.nativeFallbackPercent,
-          logicalGuardAvailable,
-        )
-      ) {
+        shouldCancelNativeThreshold({
+          awaitingUsageRefresh: state.awaitingUsageRefresh,
+          usageTokens: boundary?.tokens ?? null,
+          ceilingTokens: boundary?.ceilingTokens ?? null,
+        });
+
+      if (cancelThreshold) {
         state.thresholdCancelledCount += 1;
         diagnostics.record("before_compact", {
           reason: event.reason,
-          outcome: "cancel_until_native_fallback",
+          outcome: state.awaitingUsageRefresh
+            ? "cancel_awaiting_real_usage_refresh"
+            : "cancel_real_usage_below_pi_ceiling",
           willRetry: event.willRetry,
-          logicalTokens: logical.tokens,
-          logicalMessages: logical.messages,
-          logicalPercent:
-            logical.percent === null ? null : Number(logical.percent.toFixed(2)),
-          jevTriggerPercent: config.compactAtPercent,
-          nativeFallbackPercent: config.nativeFallbackPercent,
+          usageTokens: boundary?.tokens ?? null,
+          usagePercent:
+            boundary?.percent === null || boundary?.percent === undefined
+              ? null
+              : Number(boundary.percent.toFixed(2)),
+          contextWindow: boundary?.contextWindow ?? null,
+          reserveTokens: piBoundary.reserveTokens,
+          ceilingTokens: boundary?.ceilingTokens ?? null,
+          awaitingUsageRefresh: state.awaitingUsageRefresh,
           committed: state.decisions.size,
           deferredDropCalls: state.deferredDropCalls.size,
-          remoteHealthy,
-          logicalGuardAvailable,
-          retryRemainingMs: Math.max(0, state.retryAfterMs - Date.now()),
-          breakerRemainingMs: Math.max(0, state.breakerUntilMs - Date.now()),
-          lastError: state.lastError,
           thresholdCancelledCount: state.thresholdCancelledCount,
         });
         updateStatus(ctx, state);
@@ -1549,21 +1536,21 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
         reason: event.reason,
         outcome:
           event.reason === "threshold"
-            ? "pass_native_fallback"
+            ? "pass_native_real_usage_above_pi_ceiling"
             : sanitized
               ? "pass_native_sanitized"
               : "pass_native",
         willRetry: event.willRetry,
-        hasKey,
-        remoteHealthy,
-        logicalGuardAvailable,
-        breaker: breakerActive(state),
+        usageTokens: boundary?.tokens ?? null,
+        usagePercent:
+          boundary?.percent === null || boundary?.percent === undefined
+            ? null
+            : Number(boundary.percent.toFixed(2)),
+        contextWindow: boundary?.contextWindow ?? null,
+        reserveTokens: piBoundary.reserveTokens,
+        ceilingTokens: boundary?.ceilingTokens ?? null,
+        awaitingUsageRefresh: state.awaitingUsageRefresh,
         lastError: state.lastError,
-        logicalTokens: logical.tokens,
-        logicalMessages: logical.messages,
-        logicalPercent:
-          logical.percent === null ? null : Number(logical.percent.toFixed(2)),
-        nativeFallbackPercent: config.nativeFallbackPercent,
         sanitized,
         thresholdPassedCount: state.thresholdPassedCount,
       });
@@ -1578,7 +1565,6 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
         outcome: "fail_open_to_native",
       });
       updateStatus(ctx, state);
-      // Never let a Jev integration error disable Pi's built-in safety net.
       return;
     }
   });
