@@ -1,16 +1,46 @@
 import type { CallAction } from "./fast-jev-core.ts";
 
-export interface TurnEndEvaluationPolicy {
-  triggerPercent: number;
-  midPercent: number;
-  urgentPercent: number;
-  lowPressureResultTokens: number;
-  midPressureResultTokens: number;
-  urgentResultTokens: number;
+export interface RealContextBoundary {
+  tokens: number | null;
+  contextWindow: number;
+  reserveTokens: number;
+  ceilingTokens: number;
+  percent: number | null;
+  overCeiling: boolean;
 }
 
-export function acceptsReduction(ratio: number, minimum: number): boolean {
-  return Number.isFinite(ratio) && Number.isFinite(minimum) && ratio >= minimum;
+export function contextCeiling(contextWindow: number, reserveTokens: number): number {
+  if (!Number.isFinite(contextWindow) || contextWindow <= 0) return 0;
+  const reserve = Number.isFinite(reserveTokens) ? Math.max(0, reserveTokens) : 0;
+  return Math.max(0, contextWindow - reserve);
+}
+
+export function realContextBoundary(args: {
+  tokens: number | null | undefined;
+  contextWindow: number | null | undefined;
+  reserveTokens: number;
+}): RealContextBoundary | null {
+  const { tokens, contextWindow, reserveTokens } = args;
+  if (!contextWindow || !Number.isFinite(contextWindow) || contextWindow <= 0) return null;
+
+  const ceilingTokens = contextCeiling(contextWindow, reserveTokens);
+  const realTokens =
+    tokens !== null && tokens !== undefined && Number.isFinite(tokens)
+      ? Math.max(0, tokens)
+      : null;
+
+  return {
+    tokens: realTokens,
+    contextWindow,
+    reserveTokens: Math.max(0, Number.isFinite(reserveTokens) ? reserveTokens : 0),
+    ceilingTokens,
+    percent: realTokens === null ? null : (realTokens / contextWindow) * 100,
+    overCeiling: realTokens !== null && realTokens > ceilingTokens,
+  };
+}
+
+export function acceptsReduction(changedResults: number): boolean {
+  return Number.isFinite(changedResults) && changedResults > 0;
 }
 
 /**
@@ -22,87 +52,52 @@ export function activeRunAction(action: CallAction): CallAction {
   return action === "drop_call" ? "drop_result" : action;
 }
 
-export function requiredNewResultTokens(
-  effectivePercent: number | null,
-  policy: TurnEndEvaluationPolicy,
-): number | null {
-  if (
-    effectivePercent === null ||
-    !Number.isFinite(effectivePercent) ||
-    effectivePercent < policy.triggerPercent
-  ) {
-    return null;
-  }
-  if (effectivePercent >= policy.urgentPercent) return policy.urgentResultTokens;
-  if (effectivePercent >= policy.midPercent) return policy.midPressureResultTokens;
-  return policy.lowPressureResultTokens;
-}
-
 /**
- * The first pass runs as soon as the trigger is crossed. Later passes are
- * driven by NEW eligible tool-result volume, with progressively lower
- * thresholds as native compaction gets closer.
+ * Auto-evaluate only when Pi's own real context usage is past its configured
+ * safe-input ceiling and there is genuinely new eligible tool output to score.
+ * Manual refresh bypasses the ceiling but still requires an eligible call.
  */
 export function shouldEvaluateAtTurnEnd(args: {
-  effectivePercent: number | null;
+  autoCompactionEnabled: boolean;
+  overCeiling: boolean;
   forceRefresh: boolean;
   eligibleCalls: number;
-  previouslyEvaluatedCalls: number;
   newEligibleCalls: number;
-  newEligibleResultTokens: number;
-  policy: TurnEndEvaluationPolicy;
 }): boolean {
   const {
-    effectivePercent,
+    autoCompactionEnabled,
+    overCeiling,
     forceRefresh,
     eligibleCalls,
-    previouslyEvaluatedCalls,
     newEligibleCalls,
-    newEligibleResultTokens,
-    policy,
   } = args;
 
   if (eligibleCalls <= 0) return false;
   if (forceRefresh) return true;
-
-  const required = requiredNewResultTokens(effectivePercent, policy);
-  if (required === null) return false;
-
-  // First pressure-triggered evaluation in this logical-history segment.
-  if (previouslyEvaluatedCalls <= 0) return true;
-
-  if (newEligibleCalls <= 0) return false;
-  return newEligibleResultTokens >= required;
-}
-
-export function canGuardNativeThreshold(args: {
-  enabled: boolean;
-  hasKey: boolean;
-  remoteHealthy: boolean;
-  committedDecisions: number;
-}): boolean {
-  const { enabled, hasKey, remoteHealthy, committedDecisions } = args;
-  if (!enabled || !hasKey) return false;
-
-  // A failed refresh must not invalidate already-committed logical pruning.
-  // Once we have a logical history to apply, remote timeout/backoff/breaker
-  // state is irrelevant to whether that history is safe to keep using.
-  return committedDecisions > 0 || remoteHealthy;
+  return autoCompactionEnabled && overCeiling && newEligibleCalls > 0;
 }
 
 /**
- * Pi may request its built-in threshold compaction earlier than Jev. Delay that
- * request until our later native-fallback boundary whenever the extension can
- * still provide a valid logical history. Remote Jev availability matters only
- * before any logical decisions have been committed.
+ * A successful Jev pass changes the next model-facing prompt, but Pi cannot
+ * report the new real usage until a provider request has actually consumed it.
+ * Cancel the pending threshold compaction once while waiting for that refresh.
+ *
+ * Outside that one stale-usage window, trust Pi's real usage directly. If Pi
+ * somehow asks to compact while its current usage is already below its own
+ * ceiling, cancel the redundant request; otherwise let native compaction run.
  */
-export function shouldDelayNativeThreshold(
-  logicalPercent: number | null,
-  fallbackPercent: number,
-  logicalGuardAvailable: boolean,
-): boolean {
-  return logicalGuardAvailable &&
-    logicalPercent !== null &&
-    Number.isFinite(logicalPercent) &&
-    logicalPercent < fallbackPercent;
+export function shouldCancelNativeThreshold(args: {
+  awaitingUsageRefresh: boolean;
+  usageTokens: number | null;
+  ceilingTokens: number | null;
+}): boolean {
+  const { awaitingUsageRefresh, usageTokens, ceilingTokens } = args;
+  if (awaitingUsageRefresh) return true;
+  return (
+    usageTokens !== null &&
+    ceilingTokens !== null &&
+    Number.isFinite(usageTokens) &&
+    Number.isFinite(ceilingTokens) &&
+    usageTokens <= ceilingTokens
+  );
 }
