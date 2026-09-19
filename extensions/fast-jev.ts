@@ -645,26 +645,13 @@ interface PiCompactionBoundary {
   boundary: RealContextBoundary | null;
 }
 
-let settingsManagerCache:
-  | { cwd: string; trusted: boolean; manager: SettingsManager }
-  | undefined;
-
 function resolvedSettingsManager(ctx: ExtensionContext): SettingsManager {
-  const trusted = ctx.isProjectTrusted();
-  if (
-    !settingsManagerCache ||
-    settingsManagerCache.cwd !== ctx.cwd ||
-    settingsManagerCache.trusted !== trusted
-  ) {
-    settingsManagerCache = {
-      cwd: ctx.cwd,
-      trusted,
-      manager: SettingsManager.create(ctx.cwd, getAgentDir(), {
-        projectTrusted: trusted,
-      }),
-    };
-  }
-  return settingsManagerCache.manager;
+  // Resolve from disk each time so changes made through Pi settings/model
+  // overrides are reflected without introducing a second long-lived settings
+  // cache inside the extension.
+  return SettingsManager.create(ctx.cwd, getAgentDir(), {
+    projectTrusted: ctx.isProjectTrusted(),
+  });
 }
 
 function piCompactionBoundary(ctx: ExtensionContext): PiCompactionBoundary {
