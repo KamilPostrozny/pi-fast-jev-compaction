@@ -5,6 +5,7 @@ import {
   activeRunAction,
   contextCeiling,
   realContextBoundary,
+  reconcilePressureEpisode,
   shouldCancelNativeThreshold,
   shouldEvaluateAtTurnEnd,
 } from "../extensions/policy.ts";
@@ -57,11 +58,88 @@ test("real context boundary has no opinion when Pi usage is unavailable", () => 
   assert.equal(boundary?.overCeiling, false);
 });
 
-test("automatic Jev evaluation requires Pi ceiling pressure and new eligible output", () => {
+test("accepted Jev pass is validated by the next real post-turn usage", () => {
+  assert.equal(
+    reconcilePressureEpisode({
+      state: "awaiting_validation",
+      usageRefreshed: false,
+      overCeiling: true,
+    }),
+    "awaiting_validation",
+  );
+  assert.equal(
+    reconcilePressureEpisode({
+      state: "awaiting_validation",
+      usageRefreshed: true,
+      overCeiling: false,
+    }),
+    "armed",
+  );
+  assert.equal(
+    reconcilePressureEpisode({
+      state: "awaiting_validation",
+      usageRefreshed: true,
+      overCeiling: true,
+    }),
+    "exhausted",
+  );
+  assert.equal(
+    reconcilePressureEpisode({
+      state: "awaiting_validation",
+      usageRefreshed: true,
+      overCeiling: null,
+    }),
+    "exhausted",
+  );
+});
+
+test("exhausted pressure episode only re-arms after real usage returns below ceiling", () => {
+  assert.equal(
+    reconcilePressureEpisode({
+      state: "exhausted",
+      usageRefreshed: false,
+      overCeiling: true,
+    }),
+    "exhausted",
+  );
+  assert.equal(
+    reconcilePressureEpisode({
+      state: "exhausted",
+      usageRefreshed: false,
+      overCeiling: false,
+    }),
+    "armed",
+  );
+});
+
+test("automatic Jev evaluation runs once per above-ceiling pressure episode", () => {
   assert.equal(
     shouldEvaluateAtTurnEnd({
       autoCompactionEnabled: true,
-      overCeiling: false,
+      overCeiling: true,
+      pressureEpisode: "armed",
+      forceRefresh: false,
+      eligibleCalls: 10,
+      newEligibleCalls: 1,
+    }),
+    true,
+  );
+  assert.equal(
+    shouldEvaluateAtTurnEnd({
+      autoCompactionEnabled: true,
+      overCeiling: true,
+      pressureEpisode: "awaiting_validation",
+      forceRefresh: false,
+      eligibleCalls: 10,
+      newEligibleCalls: 1,
+    }),
+    false,
+  );
+  assert.equal(
+    shouldEvaluateAtTurnEnd({
+      autoCompactionEnabled: true,
+      overCeiling: true,
+      pressureEpisode: "exhausted",
       forceRefresh: false,
       eligibleCalls: 10,
       newEligibleCalls: 10,
@@ -71,40 +149,22 @@ test("automatic Jev evaluation requires Pi ceiling pressure and new eligible out
   assert.equal(
     shouldEvaluateAtTurnEnd({
       autoCompactionEnabled: true,
-      overCeiling: true,
+      overCeiling: false,
+      pressureEpisode: "armed",
       forceRefresh: false,
       eligibleCalls: 10,
-      newEligibleCalls: 0,
-    }),
-    false,
-  );
-  assert.equal(
-    shouldEvaluateAtTurnEnd({
-      autoCompactionEnabled: true,
-      overCeiling: true,
-      forceRefresh: false,
-      eligibleCalls: 10,
-      newEligibleCalls: 1,
-    }),
-    true,
-  );
-  assert.equal(
-    shouldEvaluateAtTurnEnd({
-      autoCompactionEnabled: false,
-      overCeiling: true,
-      forceRefresh: false,
-      eligibleCalls: 10,
-      newEligibleCalls: 1,
+      newEligibleCalls: 10,
     }),
     false,
   );
 });
 
-test("manual refresh bypasses ceiling but still needs an eligible call", () => {
+test("manual refresh bypasses pressure episode state but still needs an eligible call", () => {
   assert.equal(
     shouldEvaluateAtTurnEnd({
-      autoCompactionEnabled: false,
-      overCeiling: false,
+      autoCompactionEnabled: true,
+      overCeiling: true,
+      pressureEpisode: "exhausted",
       forceRefresh: true,
       eligibleCalls: 1,
       newEligibleCalls: 0,
@@ -115,6 +175,7 @@ test("manual refresh bypasses ceiling but still needs an eligible call", () => {
     shouldEvaluateAtTurnEnd({
       autoCompactionEnabled: true,
       overCeiling: true,
+      pressureEpisode: "exhausted",
       forceRefresh: true,
       eligibleCalls: 0,
       newEligibleCalls: 0,
@@ -123,27 +184,35 @@ test("manual refresh bypasses ceiling but still needs an eligible call", () => {
   );
 });
 
-test("any actual pruning is accepted; there is no aggregate reduction threshold", () => {
+test("any actual pruning is accepted but must still pass pressure validation", () => {
   assert.equal(acceptsReduction(0), false);
   assert.equal(acceptsReduction(1), true);
   assert.equal(acceptsReduction(20), true);
 });
 
-test("native threshold is cancelled once while waiting for fresh provider usage", () => {
+test("native threshold is cancelled only while the one Jev attempt awaits validation", () => {
   assert.equal(
     shouldCancelNativeThreshold({
-      awaitingUsageRefresh: true,
+      pressureEpisode: "awaiting_validation",
       usageTokens: 100_000,
       ceilingTokens: 96_256,
     }),
     true,
   );
-});
-
-test("outside stale-usage window native decision trusts real Pi usage only", () => {
   assert.equal(
     shouldCancelNativeThreshold({
-      awaitingUsageRefresh: false,
+      pressureEpisode: "exhausted",
+      usageTokens: 100_000,
+      ceilingTokens: 96_256,
+    }),
+    false,
+  );
+});
+
+test("outside validation window native decision trusts real Pi usage only", () => {
+  assert.equal(
+    shouldCancelNativeThreshold({
+      pressureEpisode: "armed",
       usageTokens: 96_000,
       ceilingTokens: 96_256,
     }),
@@ -151,7 +220,15 @@ test("outside stale-usage window native decision trusts real Pi usage only", () 
   );
   assert.equal(
     shouldCancelNativeThreshold({
-      awaitingUsageRefresh: false,
+      pressureEpisode: "exhausted",
+      usageTokens: 96_000,
+      ceilingTokens: 96_256,
+    }),
+    true,
+  );
+  assert.equal(
+    shouldCancelNativeThreshold({
+      pressureEpisode: "armed",
       usageTokens: 96_257,
       ceilingTokens: 96_256,
     }),
@@ -159,7 +236,7 @@ test("outside stale-usage window native decision trusts real Pi usage only", () 
   );
   assert.equal(
     shouldCancelNativeThreshold({
-      awaitingUsageRefresh: false,
+      pressureEpisode: "armed",
       usageTokens: null,
       ceilingTokens: 96_256,
     }),
