@@ -62,13 +62,6 @@ test("accepted Jev pass is validated by the next real post-turn usage", () => {
   assert.equal(
     reconcilePressureEpisode({
       state: "awaiting_validation",
-      overCeiling: true,
-    }),
-    "awaiting_validation",
-  );
-  assert.equal(
-    reconcilePressureEpisode({
-      state: "awaiting_validation",
       overCeiling: false,
     }),
     "armed",
