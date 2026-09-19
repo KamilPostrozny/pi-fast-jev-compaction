@@ -19,6 +19,7 @@ import { Diagnostics, summarizeDiagnostic } from "./diagnostics.ts";
 import {
   acceptsReduction,
   activeRunAction,
+  PRESSURE_REARM_PERCENT,
   realContextBoundary,
   reconcilePressureEpisode,
   shouldCancelNativeThreshold,
@@ -1077,16 +1078,23 @@ async function evaluateAtTurnEnd(
   const episodeBeforeReconcile = state.pressureEpisode;
   state.pressureEpisode = reconcilePressureEpisode({
     state: state.pressureEpisode,
-    overCeiling: boundary ? boundary.overCeiling : null,
+    usagePercent: boundary?.percent ?? null,
   });
   if (episodeBeforeReconcile === "awaiting_validation") {
     diagnostics.record("pressure_episode_validated", {
       turnIndex,
       outcome:
         state.pressureEpisode === "armed"
-          ? "jev_restored_below_ceiling"
-          : "jev_failed_to_restore_ceiling",
+          ? "jev_restored_rearm_headroom"
+          : boundary?.overCeiling
+            ? "jev_failed_to_restore_ceiling"
+            : "jev_below_ceiling_but_disarmed",
       usageTokens: boundary?.tokens ?? null,
+      usagePercent:
+        boundary?.percent === null || boundary?.percent === undefined
+          ? null
+          : Number(boundary.percent.toFixed(2)),
+      rearmPercent: PRESSURE_REARM_PERCENT,
       ceilingTokens: boundary?.ceilingTokens ?? null,
       overCeiling: boundary?.overCeiling ?? null,
     });
@@ -1097,6 +1105,11 @@ async function evaluateAtTurnEnd(
     diagnostics.record("pressure_episode_rearmed", {
       turnIndex,
       usageTokens: boundary?.tokens ?? null,
+      usagePercent:
+        boundary?.percent === null || boundary?.percent === undefined
+          ? null
+          : Number(boundary.percent.toFixed(2)),
+      rearmPercent: PRESSURE_REARM_PERCENT,
       ceilingTokens: boundary?.ceilingTokens ?? null,
     });
   }
@@ -1139,6 +1152,7 @@ async function evaluateAtTurnEnd(
     committed: state.decisions.size,
     deferredDropCalls: state.deferredDropCalls.size,
     pressureEpisode: state.pressureEpisode,
+    rearmPercent: PRESSURE_REARM_PERCENT,
   });
 
   if (!shouldEvaluate) {
@@ -1267,7 +1281,8 @@ async function evaluateAtTurnEnd(
       persistLogicalState(pi, diagnostics, state, "turn_end_result_only");
       // Pi's usage is still from the request that saw the pre-pruned context.
       // Give the new logical history exactly one provider request/turn to prove
-      // that real post-turn usage is back inside Pi's safe ceiling.
+      // that real post-turn usage reached the lower hysteresis boundary. Merely
+      // slipping below Pi's native ceiling is not enough to re-arm Jev.
       state.pressureEpisode = "awaiting_validation";
     }
 
@@ -1372,8 +1387,9 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
   };
 
   diagnostics.record("extension_loaded", {
-    version: "0.7.1",
-    thresholdMode: "pi_real_usage_pressure_episode",
+    version: "0.7.2",
+    thresholdMode: "pi_real_usage_pressure_hysteresis",
+    rearmPercent: PRESSURE_REARM_PERCENT,
     requestTimeoutMs: config.requestTimeoutMs,
     evaluationTimeoutMs: config.evaluationTimeoutMs,
     circuitBreakerFailures: config.circuitBreakerFailures,
