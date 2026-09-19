@@ -1692,7 +1692,7 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
       `persisted Pi transcript≈${formatTokens(state.lastRawTokens ?? 0)}${rawWindow} (${(state.lastRawPercent ?? 0).toFixed(1)}%) · calls=${state.lastGrossToolCalls ?? "n/a"}; diagnostic only`,
       `committed decisions: ${state.decisions.size} total · drop_call=${committedDropCalls} · drop_result=${committedDropResults} · keep=${committedKeeps} · deferred drop_call=${state.deferredDropCalls.size} · restored=${state.restoredDecisionCount}`,
       `evaluations: ${state.evaluationSuccesses}/${state.evaluationAttempts} successful · Jev HTTP requests=${state.totalHttpRequests} total${state.lastEvaluationRequests !== undefined ? ` (last pass=${state.lastEvaluationRequests})` : ""}`,
-      `pressure episode: ${state.pressureEpisode} · new eligible result≈${formatTokens(state.lastNewEligibleResultTokens ?? 0)} tokens · baseline calls=${state.lastEvaluatedEligibleIds.size}`,
+      `pressure episode: ${state.pressureEpisode} · re-arm≤${PRESSURE_REARM_PERCENT}% · new eligible result≈${formatTokens(state.lastNewEligibleResultTokens ?? 0)} tokens · baseline calls=${state.lastEvaluatedEligibleIds.size}`,
       result
         ? `last pass: mode=${state.lastEvaluationMode ?? "n/a"} · effective reduction=${state.lastEffectiveReduction === undefined ? "n/a" : percent(state.lastEffectiveReduction)} · upstream=${percent(reductionRatio(result))} · eligible=${state.lastEvaluationEligible ?? "n/a"} · ${state.lastEvaluationMs ?? "n/a"}ms · Jev state≈${formatTokens(result.stats.stateTokens)} (${result.stats.stateStage || "n/a"})`
         : "last pass: n/a",
