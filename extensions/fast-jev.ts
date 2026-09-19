@@ -597,12 +597,11 @@ function restoreLogicalState(
   state.deferredDropCalls.clear();
   state.lastEvaluatedEligibleIds.clear();
   state.lastNewEligibleResultTokens = undefined;
-  state.lastRequiredNewResultTokens = undefined;
+  state.awaitingUsageRefresh = false;
   state.restoredDecisionCount = restored.size;
   state.lastResult = undefined;
   state.lastEffectiveReduction = undefined;
   state.lastEvaluationMode = undefined;
-  state.pendingReductionTokens = 0;
   state.lastError = undefined;
   state.insufficient = false;
   state.forceRefresh = false;
@@ -640,14 +639,48 @@ function toolResultTokenVolume(
   return total;
 }
 
-function evaluationPolicy(config: Config): TurnEndEvaluationPolicy {
+interface PiCompactionBoundary {
+  autoCompactionEnabled: boolean;
+  reserveTokens: number;
+  boundary: RealContextBoundary | null;
+}
+
+let settingsManagerCache:
+  | { cwd: string; trusted: boolean; manager: SettingsManager }
+  | undefined;
+
+function resolvedSettingsManager(ctx: ExtensionContext): SettingsManager {
+  const trusted = ctx.isProjectTrusted();
+  if (
+    !settingsManagerCache ||
+    settingsManagerCache.cwd !== ctx.cwd ||
+    settingsManagerCache.trusted !== trusted
+  ) {
+    settingsManagerCache = {
+      cwd: ctx.cwd,
+      trusted,
+      manager: SettingsManager.create(ctx.cwd, getAgentDir(), {
+        projectTrusted: trusted,
+      }),
+    };
+  }
+  return settingsManagerCache.manager;
+}
+
+function piCompactionBoundary(ctx: ExtensionContext): PiCompactionBoundary {
+  const usage = ctx.getContextUsage();
+  const manager = resolvedSettingsManager(ctx);
+  const settings = manager.getCompactionSettings(
+    ctx.model ? { provider: ctx.model.provider, id: ctx.model.id } : undefined,
+  );
   return {
-    triggerPercent: config.compactAtPercent,
-    midPercent: config.reevaluateMidPercent,
-    urgentPercent: config.reevaluateUrgentPercent,
-    lowPressureResultTokens: config.reevaluateLowResultTokens,
-    midPressureResultTokens: config.reevaluateMidResultTokens,
-    urgentResultTokens: config.reevaluateUrgentResultTokens,
+    autoCompactionEnabled: settings.enabled,
+    reserveTokens: settings.reserveTokens,
+    boundary: realContextBoundary({
+      tokens: usage?.tokens,
+      contextWindow: usage?.contextWindow ?? ctx.model?.contextWindow,
+      reserveTokens: settings.reserveTokens,
+    }),
   };
 }
 
@@ -968,43 +1001,6 @@ function sanitizeCompactionPreparation(
   };
 }
 
-function logicalContextAtCompaction(
-  ctx: ExtensionContext,
-  state: RuntimeState,
-): { tokens: number; messages: number; percent: number | null } {
-  const raw = ctx.sessionManager.buildSessionContext().messages;
-  const logical = applyDecisionsDetailed(
-    raw,
-    state.decisions,
-    decisionIds(state.decisions),
-  ).messages;
-  const projection = projectMessages(logical);
-  const tokens = rawTokenEstimate(projection.messages, ctx);
-  const usage = ctx.getContextUsage();
-  const contextWindow = usage?.contextWindow ?? ctx.model?.contextWindow;
-  const estimatedPercent =
-    contextWindow && contextWindow > 0 ? (tokens / contextWindow) * 100 : null;
-  const adjustedUsagePercent =
-    usage?.tokens !== null &&
-    usage?.tokens !== undefined &&
-    contextWindow &&
-    contextWindow > 0
-      ? (Math.max(0, usage.tokens - state.pendingReductionTokens) / contextWindow) * 100
-      : usage?.percent ?? null;
-  // Calibrate the local estimate against Pi's provider-backed usage while
-  // subtracting only pruning committed after that usage measurement.
-  const percent =
-    adjustedUsagePercent === null || adjustedUsagePercent === undefined
-      ? estimatedPercent
-      : estimatedPercent === null
-        ? adjustedUsagePercent
-        : Math.max(adjustedUsagePercent, estimatedPercent);
-  return {
-    tokens,
-    messages: logical.length,
-    percent,
-  };
-}
 
 function failOpen(
   ctx: ExtensionContext,
@@ -1316,20 +1312,13 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
     totalHttpTimeouts: 0,
     providerRequestCount: 0,
     deferredDropCalls: new Map(),
-    pendingReductionTokens: 0,
+    awaitingUsageRefresh: false,
     lastEvaluatedEligibleIds: new Set(),
   };
 
   diagnostics.record("extension_loaded", {
-    version: "0.6.4",
-    compactAtPercent: config.compactAtPercent,
-    nativeFallbackPercent: config.nativeFallbackPercent,
-    reevaluateMidPercent: config.reevaluateMidPercent,
-    reevaluateUrgentPercent: config.reevaluateUrgentPercent,
-    reevaluateLowResultTokens: config.reevaluateLowResultTokens,
-    reevaluateMidResultTokens: config.reevaluateMidResultTokens,
-    reevaluateUrgentResultTokens: config.reevaluateUrgentResultTokens,
-    minReductionRatio: config.minReductionRatio,
+    version: "0.7.0",
+    thresholdMode: "pi_real_usage_reserve",
     requestTimeoutMs: config.requestTimeoutMs,
     evaluationTimeoutMs: config.evaluationTimeoutMs,
     circuitBreakerFailures: config.circuitBreakerFailures,
