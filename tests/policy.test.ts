@@ -146,6 +146,52 @@ test("automatic Jev evaluation runs once per above-ceiling pressure episode", ()
   );
 });
 
+test("110k failed reclaim exhausts the episode instead of micro-pruning again", () => {
+  const ceiling = 96_256;
+  const before = 101_679;
+  const after = 100_987;
+
+  assert.ok(before > ceiling);
+  assert.ok(after > ceiling);
+
+  const episode = reconcilePressureEpisode({
+    state: "awaiting_validation",
+    overCeiling: after > ceiling,
+  });
+  assert.equal(episode, "exhausted");
+
+  assert.equal(
+    shouldEvaluateAtTurnEnd({
+      autoCompactionEnabled: true,
+      overCeiling: true,
+      pressureEpisode: episode,
+      forceRefresh: false,
+      eligibleCalls: 76,
+      newEligibleCalls: 1,
+    }),
+    false,
+  );
+  assert.equal(
+    shouldCancelNativeThreshold({
+      pressureEpisode: episode,
+      usageTokens: after,
+      ceilingTokens: ceiling,
+    }),
+    false,
+  );
+});
+
+test("64k successful reclaim re-arms a future pressure episode", () => {
+  const ceiling = 49_152;
+  const after = 34_285;
+
+  const episode = reconcilePressureEpisode({
+    state: "awaiting_validation",
+    overCeiling: after > ceiling,
+  });
+  assert.equal(episode, "armed");
+});
+
 test("manual refresh bypasses pressure episode state but still needs an eligible call", () => {
   assert.equal(
     shouldEvaluateAtTurnEnd({
