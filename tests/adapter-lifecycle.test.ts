@@ -52,7 +52,12 @@ test("drop_result uses an explicit pruned marker without retaining a source pref
   assert.doesNotMatch(source, /text\.slice\(0,\s*headChars\)/);
 });
 
-test("automatic thresholds come from Pi compaction settings, not extension constants", () => {
+test("pressure hysteresis uses one explicit re-arm percentage", () => {
+  assert.match(source, /PRESSURE_REARM_PERCENT/);
+  assert.match(source, /rearmPercent:/);
+});
+
+test("automatic trigger and native ceiling still come from Pi compaction settings", () => {
   assert.match(source, /SettingsManager\.create/);
   assert.match(source, /getCompactionSettings/);
   assert.match(source, /realContextBoundary/);
@@ -114,7 +119,7 @@ test("provider response does not decide pressure validation before turn_end", ()
   assert.doesNotMatch(block, /state\.pressureEpisode = "exhausted"/);
 });
 
-test("next post-turn real usage decides whether Jev re-arms or native compaction wins", () => {
+test("next post-turn real usage decides whether Jev re-arms, stays disarmed, or native compaction wins", () => {
   const evaluateBlock = blockBetween(
     "async function evaluateAtTurnEnd",
     "export default function fastJevCompaction",
@@ -123,7 +128,8 @@ test("next post-turn real usage decides whether Jev re-arms or native compaction
   const scheduleAt = evaluateBlock.indexOf("shouldEvaluateAtTurnEnd");
   assert.ok(reconcileAt >= 0);
   assert.ok(scheduleAt > reconcileAt);
-  assert.match(evaluateBlock, /jev_restored_below_ceiling/);
+  assert.match(evaluateBlock, /jev_restored_rearm_headroom/);
+  assert.match(evaluateBlock, /jev_below_ceiling_but_disarmed/);
   assert.match(evaluateBlock, /jev_failed_to_restore_ceiling/);
 });
 
