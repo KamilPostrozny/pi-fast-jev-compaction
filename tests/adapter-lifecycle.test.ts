@@ -79,6 +79,17 @@ test("normal scheduling uses Pi real usage while local estimate is diagnostic on
   assert.doesNotMatch(evaluateBlock, /effectivePercent/);
 });
 
+test("automatic pressure attempt is consumed before remote evaluation starts", () => {
+  const evaluateBlock = blockBetween(
+    "async function evaluateAtTurnEnd",
+    "export default function fastJevCompaction",
+  );
+  const exhaustAt = evaluateBlock.indexOf('state.pressureEpisode = "exhausted"');
+  const remoteAt = evaluateBlock.indexOf("await evaluate(");
+  assert.ok(exhaustAt >= 0);
+  assert.ok(remoteAt > exhaustAt);
+});
+
 test("native threshold cancels only the single awaiting-validation attempt", () => {
   const compactHook = blockBetween(
     'pi.on("session_before_compact"',
