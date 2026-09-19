@@ -1063,58 +1063,64 @@ async function evaluateAtTurnEnd(
     projection.protectedToolCallIds,
   );
   const eligibleNow = eligibleToolIds(calls);
-  const previouslyEvaluatedNow = new Set(
-    [...state.lastEvaluatedEligibleIds].filter((id) => eligibleNow.has(id)),
-  );
   const newEligibleIds = newEligibleToolIds(eligibleNow, state.lastEvaluatedEligibleIds);
   const newEligibleResultTokens = toolResultTokenVolume(projection.messages, newEligibleIds);
 
   const usage = ctx.getContextUsage();
-  const contextWindow = usage?.contextWindow ?? ctx.model?.contextWindow;
+  const piBoundary = piCompactionBoundary(ctx);
+  const boundary = piBoundary.boundary;
+  const contextWindow = boundary?.contextWindow ?? usage?.contextWindow ?? ctx.model?.contextWindow;
   const logicalTokens = rawTokenEstimate(projection.messages, ctx);
   const logicalPercent =
     contextWindow && contextWindow > 0 ? (logicalTokens / contextWindow) * 100 : null;
-  const effectivePercent = usage?.percent ?? logicalPercent;
-  const policy = evaluationPolicy(config);
-  const requiredResultTokens = requiredNewResultTokens(effectivePercent, policy);
 
-  state.lastPiTokens = usage?.tokens ?? undefined;
-  state.lastPiPercent = effectivePercent ?? undefined;
+  state.lastPiTokens = boundary?.tokens ?? undefined;
+  state.lastPiPercent = boundary?.percent ?? undefined;
   state.lastContextWindow = contextWindow;
   state.lastLogicalTokens = logicalTokens;
   state.lastLogicalPercent = logicalPercent ?? undefined;
   state.lastLogicalToolCalls = calls.length;
   state.lastNewEligibleResultTokens = newEligibleResultTokens;
-  state.lastRequiredNewResultTokens = requiredResultTokens;
-  state.active = effectivePercent !== null && effectivePercent >= config.compactAtPercent;
+  state.lastReserveTokens = piBoundary.reserveTokens;
+  state.lastCeilingTokens = boundary?.ceilingTokens;
+  state.lastAutoCompactionEnabled = piBoundary.autoCompactionEnabled;
+  state.active = Boolean(
+    piBoundary.autoCompactionEnabled &&
+      boundary?.overCeiling,
+  );
 
   const forceRefresh = state.forceRefresh;
   const shouldEvaluate = shouldEvaluateAtTurnEnd({
-    effectivePercent,
+    autoCompactionEnabled: piBoundary.autoCompactionEnabled,
+    overCeiling: boundary?.overCeiling ?? false,
     forceRefresh,
     eligibleCalls: eligibleNow.size,
-    previouslyEvaluatedCalls: previouslyEvaluatedNow.size,
     newEligibleCalls: newEligibleIds.size,
-    newEligibleResultTokens,
-    policy,
   });
 
   diagnostics.record("turn_evaluation_check", {
     turnIndex,
-    effectivePercent: effectivePercent === null ? null : Number(effectivePercent.toFixed(2)),
-    logicalPercent: logicalPercent === null ? null : Number(logicalPercent.toFixed(2)),
-    triggerPercent: config.compactAtPercent,
-    midPercent: config.reevaluateMidPercent,
-    urgentPercent: config.reevaluateUrgentPercent,
+    usageTokens: boundary?.tokens ?? null,
+    usagePercent:
+      boundary?.percent === null || boundary?.percent === undefined
+        ? null
+        : Number(boundary.percent.toFixed(2)),
+    contextWindow: boundary?.contextWindow ?? null,
+    reserveTokens: piBoundary.reserveTokens,
+    ceilingTokens: boundary?.ceilingTokens ?? null,
+    overCeiling: boundary?.overCeiling ?? null,
+    autoCompactionEnabled: piBoundary.autoCompactionEnabled,
+    logicalEstimateTokens: logicalTokens,
+    logicalEstimatePercent:
+      logicalPercent === null ? null : Number(logicalPercent.toFixed(2)),
     eligible: eligibleNow.size,
-    previouslyEvaluatedEligible: previouslyEvaluatedNow.size,
     newEligibleCalls: newEligibleIds.size,
     newEligibleResultTokens,
-    requiredNewResultTokens: requiredResultTokens,
     forced: forceRefresh,
     shouldEvaluate,
     committed: state.decisions.size,
     deferredDropCalls: state.deferredDropCalls.size,
+    awaitingUsageRefresh: state.awaitingUsageRefresh,
   });
 
   if (!shouldEvaluate) {
@@ -1164,8 +1170,8 @@ async function evaluateAtTurnEnd(
     state,
     eligibleNow.size,
     logicalTokens,
-    effectivePercent,
-    forceRefresh ? ["forced"] : ["turn_end_threshold"],
+    boundary?.percent ?? null,
+    forceRefresh ? ["forced"] : ["pi_compaction_ceiling"],
   );
   diagnostics.record("evaluation_start", {
     turnIndex,
@@ -1174,10 +1180,15 @@ async function evaluateAtTurnEnd(
     logicalCalls: calls.length,
     committedBefore: state.decisions.size,
     logicalTokens,
-    effectivePercent: effectivePercent === null ? null : Number(effectivePercent.toFixed(2)),
+    usageTokens: boundary?.tokens ?? null,
+    usagePercent:
+      boundary?.percent === null || boundary?.percent === undefined
+        ? null
+        : Number(boundary.percent.toFixed(2)),
+    reserveTokens: piBoundary.reserveTokens,
+    ceilingTokens: boundary?.ceilingTokens ?? null,
     newEligibleCalls: newEligibleIds.size,
     newEligibleResultTokens,
-    requiredNewResultTokens: requiredResultTokens,
     timeoutMs: config.evaluationTimeoutMs,
   });
 
