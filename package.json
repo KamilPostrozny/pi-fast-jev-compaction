@@ -1,7 +1,7 @@
 {
   "name": "pi-fast-jev-compaction",
-  "version": "0.6.4",
-  "description": "Restored 0.5 Jev scheduling with resilient logical-history native fallback.",
+  "version": "0.7.0",
+  "description": "Jev pruning for Pi driven by Pi's real context usage and configured compaction reserve.",
   "type": "module",
   "license": "MIT",
   "keywords": [
