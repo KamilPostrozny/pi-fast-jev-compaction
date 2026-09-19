@@ -1,7 +1,9 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type {
-  ExtensionAPI,
-  ExtensionContext,
+import {
+  getAgentDir,
+  SettingsManager,
+  type ExtensionAPI,
+  type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import {
   collectToolCalls,
@@ -17,11 +19,10 @@ import { Diagnostics, summarizeDiagnostic } from "./diagnostics.ts";
 import {
   acceptsReduction,
   activeRunAction,
-  canGuardNativeThreshold,
-  requiredNewResultTokens,
-  shouldDelayNativeThreshold,
+  realContextBoundary,
+  shouldCancelNativeThreshold,
   shouldEvaluateAtTurnEnd,
-  type TurnEndEvaluationPolicy,
+  type RealContextBoundary,
 } from "./policy.ts";
 
 const STATUS_KEY = "fast-jev";
@@ -29,14 +30,6 @@ const STATE_ENTRY_TYPE = "fast-jev-compaction-state";
 const STATE_SCHEMA_VERSION = 1;
 
 export interface Config {
-  compactAtPercent: number;
-  nativeFallbackPercent: number;
-  reevaluateMidPercent: number;
-  reevaluateUrgentPercent: number;
-  reevaluateLowResultTokens: number;
-  reevaluateMidResultTokens: number;
-  reevaluateUrgentResultTokens: number;
-  minReductionRatio: number;
   keepThreshold: number;
   preserveRecentMessages: number;
   maxStateTokens: number;
@@ -55,14 +48,6 @@ export interface Config {
 }
 
 const DEFAULTS: Config = {
-  compactAtPercent: 75,
-  nativeFallbackPercent: 87.5,
-  reevaluateMidPercent: 80,
-  reevaluateUrgentPercent: 84,
-  reevaluateLowResultTokens: 2_000,
-  reevaluateMidResultTokens: 1_000,
-  reevaluateUrgentResultTokens: 1,
-  minReductionRatio: 0.01,
   keepThreshold: 0.5,
   preserveRecentMessages: 6,
   maxStateTokens: 25_000,
@@ -171,10 +156,12 @@ interface RuntimeState {
   deferredDropCalls: Map<string, CachedDecision>;
   lastEvaluationMode?: "active_result_only";
   lastEffectiveReduction?: number;
-  pendingReductionTokens: number;
+  awaitingUsageRefresh: boolean;
   lastEvaluatedEligibleIds: Set<string>;
   lastNewEligibleResultTokens?: number;
-  lastRequiredNewResultTokens?: number | null;
+  lastReserveTokens?: number;
+  lastCeilingTokens?: number;
+  lastAutoCompactionEnabled?: boolean;
 }
 
 function envNumber(name: string, fallback: number): number {
@@ -206,36 +193,7 @@ export function resolveConfig(): Config {
     requestTimeoutMs + 1_000,
     Math.floor(envNumber("PI_JEV_EVALUATION_TIMEOUT_MS", DEFAULTS.evaluationTimeoutMs)),
   );
-  const compactAtPercent = envNumber("PI_JEV_COMPACT_AT_PERCENT", DEFAULTS.compactAtPercent);
-  const reevaluateMidPercent = Math.max(
-    compactAtPercent,
-    envNumber("PI_JEV_REEVALUATE_MID_PERCENT", DEFAULTS.reevaluateMidPercent),
-  );
-  const reevaluateUrgentPercent = Math.max(
-    reevaluateMidPercent,
-    envNumber("PI_JEV_REEVALUATE_URGENT_PERCENT", DEFAULTS.reevaluateUrgentPercent),
-  );
   const config: Config = {
-    compactAtPercent,
-    nativeFallbackPercent: Math.max(
-      reevaluateUrgentPercent,
-      envNumber("PI_JEV_NATIVE_FALLBACK_PERCENT", DEFAULTS.nativeFallbackPercent),
-    ),
-    reevaluateMidPercent,
-    reevaluateUrgentPercent,
-    reevaluateLowResultTokens: Math.max(
-      1,
-      Math.floor(envNumber("PI_JEV_REEVALUATE_LOW_RESULT_TOKENS", DEFAULTS.reevaluateLowResultTokens)),
-    ),
-    reevaluateMidResultTokens: Math.max(
-      1,
-      Math.floor(envNumber("PI_JEV_REEVALUATE_MID_RESULT_TOKENS", DEFAULTS.reevaluateMidResultTokens)),
-    ),
-    reevaluateUrgentResultTokens: Math.max(
-      1,
-      Math.floor(envNumber("PI_JEV_REEVALUATE_URGENT_RESULT_TOKENS", DEFAULTS.reevaluateUrgentResultTokens)),
-    ),
-    minReductionRatio: envNumber("PI_JEV_MIN_REDUCTION_RATIO", DEFAULTS.minReductionRatio),
     keepThreshold: envNumber("PI_JEV_KEEP_THRESHOLD", DEFAULTS.keepThreshold),
     preserveRecentMessages: Math.max(
       0,
