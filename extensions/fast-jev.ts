@@ -1075,6 +1075,40 @@ async function evaluateAtTurnEnd(
   state.lastReserveTokens = piBoundary.reserveTokens;
   state.lastCeilingTokens = boundary?.ceilingTokens;
   state.lastAutoCompactionEnabled = piBoundary.autoCompactionEnabled;
+
+  const episodeBeforeReconcile = state.pressureEpisode;
+  const hadFreshValidation = state.usageRefreshReady;
+  state.pressureEpisode = reconcilePressureEpisode({
+    state: state.pressureEpisode,
+    usageRefreshed: state.usageRefreshReady,
+    overCeiling: boundary ? boundary.overCeiling : null,
+  });
+  if (
+    episodeBeforeReconcile === "awaiting_validation" &&
+    hadFreshValidation
+  ) {
+    diagnostics.record("pressure_episode_validated", {
+      turnIndex,
+      outcome:
+        state.pressureEpisode === "armed"
+          ? "jev_restored_below_ceiling"
+          : "jev_failed_to_restore_ceiling",
+      usageTokens: boundary?.tokens ?? null,
+      ceilingTokens: boundary?.ceilingTokens ?? null,
+      overCeiling: boundary?.overCeiling ?? null,
+    });
+    state.usageRefreshReady = false;
+  } else if (
+    episodeBeforeReconcile === "exhausted" &&
+    state.pressureEpisode === "armed"
+  ) {
+    diagnostics.record("pressure_episode_rearmed", {
+      turnIndex,
+      usageTokens: boundary?.tokens ?? null,
+      ceilingTokens: boundary?.ceilingTokens ?? null,
+    });
+  }
+
   state.active = Boolean(
     piBoundary.autoCompactionEnabled &&
       boundary?.overCeiling,
@@ -1084,6 +1118,7 @@ async function evaluateAtTurnEnd(
   const shouldEvaluate = shouldEvaluateAtTurnEnd({
     autoCompactionEnabled: piBoundary.autoCompactionEnabled,
     overCeiling: boundary?.overCeiling ?? false,
+    pressureEpisode: state.pressureEpisode,
     forceRefresh,
     eligibleCalls: eligibleNow.size,
     newEligibleCalls: newEligibleIds.size,
@@ -1111,7 +1146,8 @@ async function evaluateAtTurnEnd(
     shouldEvaluate,
     committed: state.decisions.size,
     deferredDropCalls: state.deferredDropCalls.size,
-    awaitingUsageRefresh: state.awaitingUsageRefresh,
+    pressureEpisode: state.pressureEpisode,
+    usageRefreshReady: state.usageRefreshReady,
   });
 
   if (!shouldEvaluate) {
@@ -1151,6 +1187,18 @@ async function evaluateAtTurnEnd(
     updateStatus(ctx, state);
     return;
   }
+
+  const automaticPressureAttempt =
+    !forceRefresh &&
+    piBoundary.autoCompactionEnabled &&
+    Boolean(boundary?.overCeiling) &&
+    state.pressureEpisode === "armed";
+
+  // One automatic attempt per pressure episode. If this attempt fails, returns
+  // no useful pruning, or the next real usage remains above the ceiling, native
+  // Pi compaction must win. An accepted pass temporarily moves to
+  // awaiting_validation below.
+  if (automaticPressureAttempt) state.pressureEpisode = "exhausted";
 
   state.evaluating = true;
   state.forceRefresh = false;
@@ -1227,9 +1275,10 @@ async function evaluateAtTurnEnd(
 
       persistLogicalState(pi, diagnostics, state, "turn_end_result_only");
       // Pi's usage is still from the request that saw the pre-pruned context.
-      // Give the new logical history one provider request to produce fresh,
-      // authoritative usage before considering native threshold compaction.
-      state.awaitingUsageRefresh = true;
+      // Give the new logical history exactly one provider request/turn to prove
+      // that real post-turn usage is back inside Pi's safe ceiling.
+      state.pressureEpisode = "awaiting_validation";
+      state.usageRefreshReady = false;
     }
 
     state.lastResult = evaluation.result;
@@ -1276,7 +1325,8 @@ async function evaluateAtTurnEnd(
       evaluatedEligibleBaseline: state.lastEvaluatedEligibleIds.size,
       newEligibleResultTokens,
       changedResults,
-      awaitingUsageRefresh: state.awaitingUsageRefresh,
+      pressureEpisode: state.pressureEpisode,
+      automaticPressureAttempt,
       actions: countActions(evaluation.result),
       accepted,
     });
