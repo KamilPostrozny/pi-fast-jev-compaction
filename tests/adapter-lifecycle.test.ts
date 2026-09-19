@@ -69,8 +69,11 @@ test("normal scheduling uses Pi real usage while local estimate is diagnostic on
   );
   assert.match(evaluateBlock, /piCompactionBoundary\(ctx\)/);
   assert.match(evaluateBlock, /boundary\?\.overCeiling/);
-  assert.match(evaluateBlock, /shouldEvaluateAtTurnEnd\(\{/);
-  assert.doesNotMatch(evaluateBlock, /logicalPercent.*shouldEvaluateAtTurnEnd/s);
+  assert.match(
+    evaluateBlock,
+    /shouldEvaluateAtTurnEnd\(\{\s*autoCompactionEnabled:[\s\S]*overCeiling:/,
+  );
+  assert.doesNotMatch(evaluateBlock, /effectivePercent/);
 });
 
 test("native threshold uses real usage and one stale-usage refresh exception", () => {
