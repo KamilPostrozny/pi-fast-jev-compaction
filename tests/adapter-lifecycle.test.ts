@@ -92,18 +92,18 @@ test("native threshold cancels only the single awaiting-validation attempt", () 
   assert.doesNotMatch(compactHook, /nativeFallbackPercent/);
 });
 
-test("successful provider response marks validation ready but does not decide success itself", () => {
+test("provider response does not decide pressure validation before turn_end", () => {
   const block = blockBetween(
     'pi.on("after_provider_response"',
     'pi.on("turn_start"',
   );
-  assert.match(block, /state\.pressureEpisode === "awaiting_validation"/);
-  assert.match(block, /state\.usageRefreshReady = true/);
+  assert.match(block, /pressureEpisode: state\.pressureEpisode/);
+  assert.doesNotMatch(block, /reconcilePressureEpisode/);
   assert.doesNotMatch(block, /state\.pressureEpisode = "armed"/);
   assert.doesNotMatch(block, /state\.pressureEpisode = "exhausted"/);
 });
 
-test("post-turn real usage decides whether Jev re-arms or native compaction wins", () => {
+test("next post-turn real usage decides whether Jev re-arms or native compaction wins", () => {
   const evaluateBlock = blockBetween(
     "async function evaluateAtTurnEnd",
     "export default function fastJevCompaction",
