@@ -62,7 +62,6 @@ test("accepted Jev pass is validated by the next real post-turn usage", () => {
   assert.equal(
     reconcilePressureEpisode({
       state: "awaiting_validation",
-      usageRefreshed: false,
       overCeiling: true,
     }),
     "awaiting_validation",
@@ -70,7 +69,6 @@ test("accepted Jev pass is validated by the next real post-turn usage", () => {
   assert.equal(
     reconcilePressureEpisode({
       state: "awaiting_validation",
-      usageRefreshed: true,
       overCeiling: false,
     }),
     "armed",
@@ -78,7 +76,6 @@ test("accepted Jev pass is validated by the next real post-turn usage", () => {
   assert.equal(
     reconcilePressureEpisode({
       state: "awaiting_validation",
-      usageRefreshed: true,
       overCeiling: true,
     }),
     "exhausted",
@@ -86,7 +83,6 @@ test("accepted Jev pass is validated by the next real post-turn usage", () => {
   assert.equal(
     reconcilePressureEpisode({
       state: "awaiting_validation",
-      usageRefreshed: true,
       overCeiling: null,
     }),
     "exhausted",
@@ -97,7 +93,6 @@ test("exhausted pressure episode only re-arms after real usage returns below cei
   assert.equal(
     reconcilePressureEpisode({
       state: "exhausted",
-      usageRefreshed: false,
       overCeiling: true,
     }),
     "exhausted",
@@ -105,7 +100,6 @@ test("exhausted pressure episode only re-arms after real usage returns below cei
   assert.equal(
     reconcilePressureEpisode({
       state: "exhausted",
-      usageRefreshed: false,
       overCeiling: false,
     }),
     "armed",
