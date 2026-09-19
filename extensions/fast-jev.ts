@@ -1761,12 +1761,6 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
     const rawMessages = ctx.sessionManager.buildSessionContext().messages;
     const rawIds = rawToolCallIds(rawMessages);
     const before = new Map(state.decisions);
-    const beforeMessages = applyDecisionsDetailed(
-      rawMessages,
-      before,
-      decisionIds(before),
-    ).messages;
-    const beforeTokens = rawTokenEstimate(projectMessages(beforeMessages).messages, ctx);
     let promoted = 0;
 
     for (const [id, deferred] of state.deferredDropCalls) {
