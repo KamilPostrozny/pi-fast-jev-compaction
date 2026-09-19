@@ -71,13 +71,14 @@ export function activeRunAction(action: CallAction): CallAction {
  */
 export function reconcilePressureEpisode(args: {
   state: PressureEpisodeState;
-  usageRefreshed: boolean;
   overCeiling: boolean | null;
 }): PressureEpisodeState {
-  const { state, usageRefreshed, overCeiling } = args;
+  const { state, overCeiling } = args;
 
+  // This function is called from turn_end. If an accepted pass set
+  // awaiting_validation during the previous turn_end, reaching this call again
+  // already proves that one complete provider turn consumed the pruned prompt.
   if (state === "awaiting_validation") {
-    if (!usageRefreshed) return state;
     return overCeiling === false ? "armed" : "exhausted";
   }
 
