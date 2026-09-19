@@ -1400,26 +1400,31 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
 
       const grossTokens = rawTokenEstimate(grossProjection.messages, ctx);
       const logicalTokens = rawTokenEstimate(logicalProjection.messages, ctx);
-      const usage = ctx.getContextUsage();
-      const contextWindow = usage?.contextWindow ?? ctx.model?.contextWindow;
+      const piBoundary = piCompactionBoundary(ctx);
+      const boundary = piBoundary.boundary;
+      const contextWindow = boundary?.contextWindow ?? ctx.model?.contextWindow;
       const grossPercent =
         contextWindow && contextWindow > 0 ? (grossTokens / contextWindow) * 100 : undefined;
       const logicalPercent =
         contextWindow && contextWindow > 0 ? (logicalTokens / contextWindow) * 100 : undefined;
-      const effectivePercent = usage?.percent ?? logicalPercent ?? null;
 
       state.lastRawTokens = grossTokens;
       state.lastRawPercent = grossPercent;
       state.lastLogicalTokens = logicalTokens;
       state.lastLogicalPercent = logicalPercent;
-      state.lastPiTokens = usage?.tokens ?? undefined;
-      state.lastPiPercent = effectivePercent ?? undefined;
+      state.lastPiTokens = boundary?.tokens ?? undefined;
+      state.lastPiPercent = boundary?.percent ?? undefined;
       state.lastContextWindow = contextWindow;
+      state.lastReserveTokens = piBoundary.reserveTokens;
+      state.lastCeilingTokens = boundary?.ceilingTokens;
+      state.lastAutoCompactionEnabled = piBoundary.autoCompactionEnabled;
       state.lastGrossToolCalls = rawIds.size;
       state.lastLogicalToolCalls = logicalCalls.length;
       state.lastApply = applied.stats;
-      state.active =
-        effectivePercent !== null && effectivePercent >= config.compactAtPercent;
+      state.active = Boolean(
+        piBoundary.autoCompactionEnabled &&
+          boundary?.overCeiling,
+      );
 
       state.lastContextOutcome =
         state.decisions.size > 0
@@ -1444,9 +1449,16 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
         contextWindow,
         grossPercent: grossPercent === undefined ? null : Number(grossPercent.toFixed(2)),
         logicalPercent: logicalPercent === undefined ? null : Number(logicalPercent.toFixed(2)),
-        piTokens: usage?.tokens ?? null,
-        piPercent: effectivePercent === null ? null : Number(effectivePercent.toFixed(2)),
-        compactAtPercent: config.compactAtPercent,
+        piTokens: boundary?.tokens ?? null,
+        piPercent:
+          boundary?.percent === null || boundary?.percent === undefined
+            ? null
+            : Number(boundary.percent.toFixed(2)),
+        reserveTokens: piBoundary.reserveTokens,
+        ceilingTokens: boundary?.ceilingTokens ?? null,
+        overCeiling: boundary?.overCeiling ?? null,
+        autoCompactionEnabled: piBoundary.autoCompactionEnabled,
+        awaitingUsageRefresh: state.awaitingUsageRefresh,
         ...applied.stats,
         durationMs: Date.now() - hookStarted,
       });
