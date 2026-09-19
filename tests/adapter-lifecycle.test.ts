@@ -45,14 +45,6 @@ test("agent_end promotes deferred full deletions only after clean stop", () => {
   assert.match(block, /deferredDropCalls\.clear\(\)/);
 });
 
-test("defaults leave a wider gap between Jev and native fallback", () => {
-  assert.match(source, /compactAtPercent:\s*75/);
-  assert.match(source, /reevaluateMidPercent:\s*80/);
-  assert.match(source, /reevaluateUrgentPercent:\s*84/);
-  assert.match(source, /nativeFallbackPercent:\s*87\.5/);
-  assert.match(source, /minReductionRatio:\s*0\.01/);
-});
-
 test("drop_result uses an explicit pruned marker without retaining a source prefix", () => {
   assert.match(source, /result pruned/);
   assert.doesNotMatch(source, /truncateResultText/);
@@ -60,45 +52,57 @@ test("drop_result uses an explicit pruned marker without retaining a source pref
   assert.doesNotMatch(source, /text\.slice\(0,\s*headChars\)/);
 });
 
+test("automatic thresholds come from Pi compaction settings, not extension constants", () => {
+  assert.match(source, /SettingsManager\.create/);
+  assert.match(source, /getCompactionSettings/);
+  assert.match(source, /realContextBoundary/);
+  assert.doesNotMatch(source, /PI_JEV_COMPACT_AT_PERCENT/);
+  assert.doesNotMatch(source, /PI_JEV_NATIVE_FALLBACK_PERCENT/);
+  assert.doesNotMatch(source, /PI_JEV_REEVALUATE_/);
+  assert.doesNotMatch(source, /minReductionRatio/);
+});
 
-test("0.5 control keeps normal Jev scheduling on Pi/provider usage", () => {
+test("normal scheduling uses Pi real usage while local estimate is diagnostic only", () => {
   const evaluateBlock = blockBetween(
     "async function evaluateAtTurnEnd",
     "export default function fastJevCompaction",
   );
-  assert.match(evaluateBlock, /effectivePercent = usage\?\.percent \?\? logicalPercent/);
-  assert.doesNotMatch(evaluateBlock, /pressureSnapshot\s*\(/);
-  assert.doesNotMatch(evaluateBlock, /calibratedPressurePercent/);
+  assert.match(evaluateBlock, /piCompactionBoundary\(ctx\)/);
+  assert.match(evaluateBlock, /boundary\?\.overCeiling/);
+  assert.match(
+    evaluateBlock,
+    /shouldEvaluateAtTurnEnd\(\{\s*autoCompactionEnabled:[\s\S]*overCeiling:/,
+  );
+  assert.doesNotMatch(evaluateBlock, /effectivePercent/);
 });
 
-test("0.5 control has no source-read pinning or recurring grounding machinery", () => {
+test("native threshold uses real usage and one stale-usage refresh exception", () => {
+  const compactHook = blockBetween(
+    'pi.on("session_before_compact"',
+    'pi.on("session_compact"',
+  );
+  assert.match(compactHook, /piCompactionBoundary\(ctx\)/);
+  assert.match(compactHook, /shouldCancelNativeThreshold\(\{/);
+  assert.match(compactHook, /awaitingUsageRefresh/);
+  assert.doesNotMatch(compactHook, /logicalContextAtCompaction/);
+  assert.doesNotMatch(compactHook, /nativeFallbackPercent/);
+});
+
+test("successful provider response clears stale usage marker", () => {
+  const block = blockBetween(
+    'pi.on("after_provider_response"',
+    'pi.on("turn_start"',
+  );
+  assert.match(block, /refreshedUsage/);
+  assert.match(block, /state\.awaitingUsageRefresh = false/);
+});
+
+test("0.6 grounding/read-pinning experiments remain absent", () => {
   assert.doesNotMatch(source, /latestReadEvidenceIds/);
   assert.doesNotMatch(source, /readEvidenceKey/);
   assert.doesNotMatch(source, /GROUNDING_REMINDER/);
   assert.doesNotMatch(source, /fast-jev-grounding/);
   assert.doesNotMatch(source, /protectedReadEvidence/);
-});
-
-test("native fallback still uses calibrated logical pressure safety check", () => {
-  const compactBlock = blockBetween(
-    "function logicalContextAtCompaction",
-    "function failOpen",
-  );
-  assert.match(compactBlock, /adjustedUsagePercent/);
-  assert.match(compactBlock, /Math\.max\(adjustedUsagePercent, estimatedPercent\)/);
-});
-
-
-test("transient Jev errors do not bypass fallback when committed logical history exists", () => {
-  const compactHook = blockBetween(
-    'pi.on("session_before_compact"',
-    'pi.on("session_compact"',
-  );
-  assert.match(compactHook, /canGuardNativeThreshold\s*\(\{/);
-  assert.match(compactHook, /committedDecisions:\s*state\.decisions\.size/);
-  assert.match(compactHook, /remoteHealthy/);
-  assert.doesNotMatch(compactHook, /const jevHealthy\s*=/);
-  assert.match(compactHook, /logicalGuardAvailable/);
 });
 
 test("Pi adapter TypeScript parses after type stripping", () => {

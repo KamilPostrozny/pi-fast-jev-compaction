@@ -3,27 +3,11 @@ import assert from "node:assert/strict";
 import {
   acceptsReduction,
   activeRunAction,
-  canGuardNativeThreshold,
-  requiredNewResultTokens,
-  shouldDelayNativeThreshold,
+  contextCeiling,
+  realContextBoundary,
+  shouldCancelNativeThreshold,
   shouldEvaluateAtTurnEnd,
-  type TurnEndEvaluationPolicy,
 } from "../extensions/policy.ts";
-
-const policy: TurnEndEvaluationPolicy = {
-  triggerPercent: 75,
-  midPercent: 80,
-  urgentPercent: 84,
-  lowPressureResultTokens: 2000,
-  midPressureResultTokens: 1000,
-  urgentResultTokens: 1,
-};
-
-test("small but useful Jev reductions are accepted", () => {
-  assert.equal(acceptsReduction(0.009, 0.01), false);
-  assert.equal(acceptsReduction(0.01, 0.01), true);
-  assert.equal(acceptsReduction(0.05, 0.01), true);
-});
 
 test("active agent runs never delete the tool-call breadcrumb", () => {
   assert.equal(activeRunAction("keep"), "keep");
@@ -31,172 +15,154 @@ test("active agent runs never delete the tool-call breadcrumb", () => {
   assert.equal(activeRunAction("drop_call"), "drop_result");
 });
 
-test("adaptive result-volume thresholds tighten near native fallback", () => {
-  assert.equal(requiredNewResultTokens(74.9, policy), null);
-  assert.equal(requiredNewResultTokens(75, policy), 2000);
-  assert.equal(requiredNewResultTokens(79.9, policy), 2000);
-  assert.equal(requiredNewResultTokens(80, policy), 1000);
-  assert.equal(requiredNewResultTokens(83.9, policy), 1000);
-  assert.equal(requiredNewResultTokens(84, policy), 1);
-  assert.equal(requiredNewResultTokens(87.4, policy), 1);
+test("context ceiling is derived from model window and Pi reserve", () => {
+  assert.equal(contextCeiling(65_536, 16_384), 49_152);
+  assert.equal(contextCeiling(112_640, 16_384), 96_256);
+  assert.equal(contextCeiling(262_144, 16_384), 245_760);
+  assert.equal(contextCeiling(262_144, 32_768), 229_376);
 });
 
-test("first Jev pass runs at 75% regardless of accumulated result volume", () => {
+test("same reserve naturally changes the percentage boundary as context grows", () => {
+  const small = realContextBoundary({
+    tokens: 49_153,
+    contextWindow: 65_536,
+    reserveTokens: 16_384,
+  });
+  const medium = realContextBoundary({
+    tokens: 96_257,
+    contextWindow: 112_640,
+    reserveTokens: 16_384,
+  });
+  const large = realContextBoundary({
+    tokens: 245_761,
+    contextWindow: 262_144,
+    reserveTokens: 16_384,
+  });
+
+  assert.equal(small?.overCeiling, true);
+  assert.equal(medium?.overCeiling, true);
+  assert.equal(large?.overCeiling, true);
+  assert.ok((small?.percent ?? 0) < (medium?.percent ?? 0));
+  assert.ok((medium?.percent ?? 0) < (large?.percent ?? 0));
+});
+
+test("real context boundary has no opinion when Pi usage is unavailable", () => {
+  const boundary = realContextBoundary({
+    tokens: null,
+    contextWindow: 112_640,
+    reserveTokens: 16_384,
+  });
+  assert.equal(boundary?.tokens, null);
+  assert.equal(boundary?.percent, null);
+  assert.equal(boundary?.overCeiling, false);
+});
+
+test("automatic Jev evaluation requires Pi ceiling pressure and new eligible output", () => {
   assert.equal(
     shouldEvaluateAtTurnEnd({
-      effectivePercent: 75,
+      autoCompactionEnabled: true,
+      overCeiling: false,
       forceRefresh: false,
       eligibleCalls: 10,
-      previouslyEvaluatedCalls: 0,
       newEligibleCalls: 10,
-      newEligibleResultTokens: 200,
-      policy,
-    }),
-    true,
-  );
-});
-
-test("later Jev passes wait for enough new result volume", () => {
-  assert.equal(
-    shouldEvaluateAtTurnEnd({
-      effectivePercent: 78,
-      forceRefresh: false,
-      eligibleCalls: 20,
-      previouslyEvaluatedCalls: 10,
-      newEligibleCalls: 2,
-      newEligibleResultTokens: 1999,
-      policy,
     }),
     false,
   );
   assert.equal(
     shouldEvaluateAtTurnEnd({
-      effectivePercent: 78,
+      autoCompactionEnabled: true,
+      overCeiling: true,
       forceRefresh: false,
-      eligibleCalls: 20,
-      previouslyEvaluatedCalls: 10,
-      newEligibleCalls: 2,
-      newEligibleResultTokens: 2000,
-      policy,
-    }),
-    true,
-  );
-  assert.equal(
-    shouldEvaluateAtTurnEnd({
-      effectivePercent: 82,
-      forceRefresh: false,
-      eligibleCalls: 20,
-      previouslyEvaluatedCalls: 10,
-      newEligibleCalls: 1,
-      newEligibleResultTokens: 1000,
-      policy,
-    }),
-    true,
-  );
-  assert.equal(
-    shouldEvaluateAtTurnEnd({
-      effectivePercent: 84,
-      forceRefresh: false,
-      eligibleCalls: 20,
-      previouslyEvaluatedCalls: 10,
-      newEligibleCalls: 1,
-      newEligibleResultTokens: 1,
-      policy,
-    }),
-    true,
-  );
-  assert.equal(
-    shouldEvaluateAtTurnEnd({
-      effectivePercent: 86,
-      forceRefresh: false,
-      eligibleCalls: 20,
-      previouslyEvaluatedCalls: 10,
+      eligibleCalls: 10,
       newEligibleCalls: 0,
-      newEligibleResultTokens: 0,
-      policy,
+    }),
+    false,
+  );
+  assert.equal(
+    shouldEvaluateAtTurnEnd({
+      autoCompactionEnabled: true,
+      overCeiling: true,
+      forceRefresh: false,
+      eligibleCalls: 10,
+      newEligibleCalls: 1,
+    }),
+    true,
+  );
+  assert.equal(
+    shouldEvaluateAtTurnEnd({
+      autoCompactionEnabled: false,
+      overCeiling: true,
+      forceRefresh: false,
+      eligibleCalls: 10,
+      newEligibleCalls: 1,
     }),
     false,
   );
 });
 
-test("forced refresh bypasses pressure and volume gates but still needs eligible calls", () => {
+test("manual refresh bypasses ceiling but still needs an eligible call", () => {
   assert.equal(
     shouldEvaluateAtTurnEnd({
-      effectivePercent: 20,
+      autoCompactionEnabled: false,
+      overCeiling: false,
       forceRefresh: true,
       eligibleCalls: 1,
-      previouslyEvaluatedCalls: 100,
       newEligibleCalls: 0,
-      newEligibleResultTokens: 0,
-      policy,
     }),
     true,
   );
   assert.equal(
     shouldEvaluateAtTurnEnd({
-      effectivePercent: 90,
+      autoCompactionEnabled: true,
+      overCeiling: true,
       forceRefresh: true,
       eligibleCalls: 0,
-      previouslyEvaluatedCalls: 0,
       newEligibleCalls: 0,
-      newEligibleResultTokens: 0,
-      policy,
     }),
     false,
   );
 });
 
-test("committed logical history keeps guarding native fallback through remote failures", () => {
+test("any actual pruning is accepted; there is no aggregate reduction threshold", () => {
+  assert.equal(acceptsReduction(0), false);
+  assert.equal(acceptsReduction(1), true);
+  assert.equal(acceptsReduction(20), true);
+});
+
+test("native threshold is cancelled once while waiting for fresh provider usage", () => {
   assert.equal(
-    canGuardNativeThreshold({
-      enabled: true,
-      hasKey: true,
-      remoteHealthy: false,
-      committedDecisions: 12,
+    shouldCancelNativeThreshold({
+      awaitingUsageRefresh: true,
+      usageTokens: 100_000,
+      ceilingTokens: 96_256,
     }),
     true,
-  );
-  assert.equal(
-    canGuardNativeThreshold({
-      enabled: true,
-      hasKey: true,
-      remoteHealthy: true,
-      committedDecisions: 0,
-    }),
-    true,
-  );
-  assert.equal(
-    canGuardNativeThreshold({
-      enabled: true,
-      hasKey: true,
-      remoteHealthy: false,
-      committedDecisions: 0,
-    }),
-    false,
-  );
-  assert.equal(
-    canGuardNativeThreshold({
-      enabled: false,
-      hasKey: true,
-      remoteHealthy: true,
-      committedDecisions: 12,
-    }),
-    false,
-  );
-  assert.equal(
-    canGuardNativeThreshold({
-      enabled: true,
-      hasKey: false,
-      remoteHealthy: true,
-      committedDecisions: 12,
-    }),
-    false,
   );
 });
 
-test("native threshold delay depends on logical guard and fallback boundary", () => {
-  assert.equal(shouldDelayNativeThreshold(87.4, 87.5, true), true);
-  assert.equal(shouldDelayNativeThreshold(87.5, 87.5, true), false);
-  assert.equal(shouldDelayNativeThreshold(76, 87.5, false), false);
-  assert.equal(shouldDelayNativeThreshold(null, 87.5, true), false);
+test("outside stale-usage window native decision trusts real Pi usage only", () => {
+  assert.equal(
+    shouldCancelNativeThreshold({
+      awaitingUsageRefresh: false,
+      usageTokens: 96_000,
+      ceilingTokens: 96_256,
+    }),
+    true,
+  );
+  assert.equal(
+    shouldCancelNativeThreshold({
+      awaitingUsageRefresh: false,
+      usageTokens: 96_257,
+      ceilingTokens: 96_256,
+    }),
+    false,
+  );
+  assert.equal(
+    shouldCancelNativeThreshold({
+      awaitingUsageRefresh: false,
+      usageTokens: null,
+      ceilingTokens: 96_256,
+    }),
+    false,
+  );
 });

@@ -1,7 +1,9 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type {
-  ExtensionAPI,
-  ExtensionContext,
+import {
+  getAgentDir,
+  SettingsManager,
+  type ExtensionAPI,
+  type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import {
   collectToolCalls,
@@ -17,11 +19,10 @@ import { Diagnostics, summarizeDiagnostic } from "./diagnostics.ts";
 import {
   acceptsReduction,
   activeRunAction,
-  canGuardNativeThreshold,
-  requiredNewResultTokens,
-  shouldDelayNativeThreshold,
+  realContextBoundary,
+  shouldCancelNativeThreshold,
   shouldEvaluateAtTurnEnd,
-  type TurnEndEvaluationPolicy,
+  type RealContextBoundary,
 } from "./policy.ts";
 
 const STATUS_KEY = "fast-jev";
@@ -29,14 +30,6 @@ const STATE_ENTRY_TYPE = "fast-jev-compaction-state";
 const STATE_SCHEMA_VERSION = 1;
 
 export interface Config {
-  compactAtPercent: number;
-  nativeFallbackPercent: number;
-  reevaluateMidPercent: number;
-  reevaluateUrgentPercent: number;
-  reevaluateLowResultTokens: number;
-  reevaluateMidResultTokens: number;
-  reevaluateUrgentResultTokens: number;
-  minReductionRatio: number;
   keepThreshold: number;
   preserveRecentMessages: number;
   maxStateTokens: number;
@@ -55,14 +48,6 @@ export interface Config {
 }
 
 const DEFAULTS: Config = {
-  compactAtPercent: 75,
-  nativeFallbackPercent: 87.5,
-  reevaluateMidPercent: 80,
-  reevaluateUrgentPercent: 84,
-  reevaluateLowResultTokens: 2_000,
-  reevaluateMidResultTokens: 1_000,
-  reevaluateUrgentResultTokens: 1,
-  minReductionRatio: 0.01,
   keepThreshold: 0.5,
   preserveRecentMessages: 6,
   maxStateTokens: 25_000,
@@ -171,10 +156,12 @@ interface RuntimeState {
   deferredDropCalls: Map<string, CachedDecision>;
   lastEvaluationMode?: "active_result_only";
   lastEffectiveReduction?: number;
-  pendingReductionTokens: number;
+  awaitingUsageRefresh: boolean;
   lastEvaluatedEligibleIds: Set<string>;
   lastNewEligibleResultTokens?: number;
-  lastRequiredNewResultTokens?: number | null;
+  lastReserveTokens?: number;
+  lastCeilingTokens?: number;
+  lastAutoCompactionEnabled?: boolean;
 }
 
 function envNumber(name: string, fallback: number): number {
@@ -206,36 +193,7 @@ export function resolveConfig(): Config {
     requestTimeoutMs + 1_000,
     Math.floor(envNumber("PI_JEV_EVALUATION_TIMEOUT_MS", DEFAULTS.evaluationTimeoutMs)),
   );
-  const compactAtPercent = envNumber("PI_JEV_COMPACT_AT_PERCENT", DEFAULTS.compactAtPercent);
-  const reevaluateMidPercent = Math.max(
-    compactAtPercent,
-    envNumber("PI_JEV_REEVALUATE_MID_PERCENT", DEFAULTS.reevaluateMidPercent),
-  );
-  const reevaluateUrgentPercent = Math.max(
-    reevaluateMidPercent,
-    envNumber("PI_JEV_REEVALUATE_URGENT_PERCENT", DEFAULTS.reevaluateUrgentPercent),
-  );
   const config: Config = {
-    compactAtPercent,
-    nativeFallbackPercent: Math.max(
-      reevaluateUrgentPercent,
-      envNumber("PI_JEV_NATIVE_FALLBACK_PERCENT", DEFAULTS.nativeFallbackPercent),
-    ),
-    reevaluateMidPercent,
-    reevaluateUrgentPercent,
-    reevaluateLowResultTokens: Math.max(
-      1,
-      Math.floor(envNumber("PI_JEV_REEVALUATE_LOW_RESULT_TOKENS", DEFAULTS.reevaluateLowResultTokens)),
-    ),
-    reevaluateMidResultTokens: Math.max(
-      1,
-      Math.floor(envNumber("PI_JEV_REEVALUATE_MID_RESULT_TOKENS", DEFAULTS.reevaluateMidResultTokens)),
-    ),
-    reevaluateUrgentResultTokens: Math.max(
-      1,
-      Math.floor(envNumber("PI_JEV_REEVALUATE_URGENT_RESULT_TOKENS", DEFAULTS.reevaluateUrgentResultTokens)),
-    ),
-    minReductionRatio: envNumber("PI_JEV_MIN_REDUCTION_RATIO", DEFAULTS.minReductionRatio),
     keepThreshold: envNumber("PI_JEV_KEEP_THRESHOLD", DEFAULTS.keepThreshold),
     preserveRecentMessages: Math.max(
       0,
@@ -639,12 +597,11 @@ function restoreLogicalState(
   state.deferredDropCalls.clear();
   state.lastEvaluatedEligibleIds.clear();
   state.lastNewEligibleResultTokens = undefined;
-  state.lastRequiredNewResultTokens = undefined;
+  state.awaitingUsageRefresh = false;
   state.restoredDecisionCount = restored.size;
   state.lastResult = undefined;
   state.lastEffectiveReduction = undefined;
   state.lastEvaluationMode = undefined;
-  state.pendingReductionTokens = 0;
   state.lastError = undefined;
   state.insufficient = false;
   state.forceRefresh = false;
@@ -682,14 +639,35 @@ function toolResultTokenVolume(
   return total;
 }
 
-function evaluationPolicy(config: Config): TurnEndEvaluationPolicy {
+interface PiCompactionBoundary {
+  autoCompactionEnabled: boolean;
+  reserveTokens: number;
+  boundary: RealContextBoundary | null;
+}
+
+function resolvedSettingsManager(ctx: ExtensionContext): SettingsManager {
+  // Resolve from disk each time so changes made through Pi settings/model
+  // overrides are reflected without introducing a second long-lived settings
+  // cache inside the extension.
+  return SettingsManager.create(ctx.cwd, getAgentDir(), {
+    projectTrusted: ctx.isProjectTrusted(),
+  });
+}
+
+function piCompactionBoundary(ctx: ExtensionContext): PiCompactionBoundary {
+  const usage = ctx.getContextUsage();
+  const manager = resolvedSettingsManager(ctx);
+  const settings = manager.getCompactionSettings(
+    ctx.model ? { provider: ctx.model.provider, id: ctx.model.id } : undefined,
+  );
   return {
-    triggerPercent: config.compactAtPercent,
-    midPercent: config.reevaluateMidPercent,
-    urgentPercent: config.reevaluateUrgentPercent,
-    lowPressureResultTokens: config.reevaluateLowResultTokens,
-    midPressureResultTokens: config.reevaluateMidResultTokens,
-    urgentResultTokens: config.reevaluateUrgentResultTokens,
+    autoCompactionEnabled: settings.enabled,
+    reserveTokens: settings.reserveTokens,
+    boundary: realContextBoundary({
+      tokens: usage?.tokens,
+      contextWindow: usage?.contextWindow ?? ctx.model?.contextWindow,
+      reserveTokens: settings.reserveTokens,
+    }),
   };
 }
 
@@ -1010,43 +988,6 @@ function sanitizeCompactionPreparation(
   };
 }
 
-function logicalContextAtCompaction(
-  ctx: ExtensionContext,
-  state: RuntimeState,
-): { tokens: number; messages: number; percent: number | null } {
-  const raw = ctx.sessionManager.buildSessionContext().messages;
-  const logical = applyDecisionsDetailed(
-    raw,
-    state.decisions,
-    decisionIds(state.decisions),
-  ).messages;
-  const projection = projectMessages(logical);
-  const tokens = rawTokenEstimate(projection.messages, ctx);
-  const usage = ctx.getContextUsage();
-  const contextWindow = usage?.contextWindow ?? ctx.model?.contextWindow;
-  const estimatedPercent =
-    contextWindow && contextWindow > 0 ? (tokens / contextWindow) * 100 : null;
-  const adjustedUsagePercent =
-    usage?.tokens !== null &&
-    usage?.tokens !== undefined &&
-    contextWindow &&
-    contextWindow > 0
-      ? (Math.max(0, usage.tokens - state.pendingReductionTokens) / contextWindow) * 100
-      : usage?.percent ?? null;
-  // Calibrate the local estimate against Pi's provider-backed usage while
-  // subtracting only pruning committed after that usage measurement.
-  const percent =
-    adjustedUsagePercent === null || adjustedUsagePercent === undefined
-      ? estimatedPercent
-      : estimatedPercent === null
-        ? adjustedUsagePercent
-        : Math.max(adjustedUsagePercent, estimatedPercent);
-  return {
-    tokens,
-    messages: logical.length,
-    percent,
-  };
-}
 
 function failOpen(
   ctx: ExtensionContext,
@@ -1109,58 +1050,64 @@ async function evaluateAtTurnEnd(
     projection.protectedToolCallIds,
   );
   const eligibleNow = eligibleToolIds(calls);
-  const previouslyEvaluatedNow = new Set(
-    [...state.lastEvaluatedEligibleIds].filter((id) => eligibleNow.has(id)),
-  );
   const newEligibleIds = newEligibleToolIds(eligibleNow, state.lastEvaluatedEligibleIds);
   const newEligibleResultTokens = toolResultTokenVolume(projection.messages, newEligibleIds);
 
   const usage = ctx.getContextUsage();
-  const contextWindow = usage?.contextWindow ?? ctx.model?.contextWindow;
+  const piBoundary = piCompactionBoundary(ctx);
+  const boundary = piBoundary.boundary;
+  const contextWindow = boundary?.contextWindow ?? usage?.contextWindow ?? ctx.model?.contextWindow;
   const logicalTokens = rawTokenEstimate(projection.messages, ctx);
   const logicalPercent =
     contextWindow && contextWindow > 0 ? (logicalTokens / contextWindow) * 100 : null;
-  const effectivePercent = usage?.percent ?? logicalPercent;
-  const policy = evaluationPolicy(config);
-  const requiredResultTokens = requiredNewResultTokens(effectivePercent, policy);
 
-  state.lastPiTokens = usage?.tokens ?? undefined;
-  state.lastPiPercent = effectivePercent ?? undefined;
+  state.lastPiTokens = boundary?.tokens ?? undefined;
+  state.lastPiPercent = boundary?.percent ?? undefined;
   state.lastContextWindow = contextWindow;
   state.lastLogicalTokens = logicalTokens;
   state.lastLogicalPercent = logicalPercent ?? undefined;
   state.lastLogicalToolCalls = calls.length;
   state.lastNewEligibleResultTokens = newEligibleResultTokens;
-  state.lastRequiredNewResultTokens = requiredResultTokens;
-  state.active = effectivePercent !== null && effectivePercent >= config.compactAtPercent;
+  state.lastReserveTokens = piBoundary.reserveTokens;
+  state.lastCeilingTokens = boundary?.ceilingTokens;
+  state.lastAutoCompactionEnabled = piBoundary.autoCompactionEnabled;
+  state.active = Boolean(
+    piBoundary.autoCompactionEnabled &&
+      boundary?.overCeiling,
+  );
 
   const forceRefresh = state.forceRefresh;
   const shouldEvaluate = shouldEvaluateAtTurnEnd({
-    effectivePercent,
+    autoCompactionEnabled: piBoundary.autoCompactionEnabled,
+    overCeiling: boundary?.overCeiling ?? false,
     forceRefresh,
     eligibleCalls: eligibleNow.size,
-    previouslyEvaluatedCalls: previouslyEvaluatedNow.size,
     newEligibleCalls: newEligibleIds.size,
-    newEligibleResultTokens,
-    policy,
   });
 
   diagnostics.record("turn_evaluation_check", {
     turnIndex,
-    effectivePercent: effectivePercent === null ? null : Number(effectivePercent.toFixed(2)),
-    logicalPercent: logicalPercent === null ? null : Number(logicalPercent.toFixed(2)),
-    triggerPercent: config.compactAtPercent,
-    midPercent: config.reevaluateMidPercent,
-    urgentPercent: config.reevaluateUrgentPercent,
+    usageTokens: boundary?.tokens ?? null,
+    usagePercent:
+      boundary?.percent === null || boundary?.percent === undefined
+        ? null
+        : Number(boundary.percent.toFixed(2)),
+    contextWindow: boundary?.contextWindow ?? null,
+    reserveTokens: piBoundary.reserveTokens,
+    ceilingTokens: boundary?.ceilingTokens ?? null,
+    overCeiling: boundary?.overCeiling ?? null,
+    autoCompactionEnabled: piBoundary.autoCompactionEnabled,
+    logicalEstimateTokens: logicalTokens,
+    logicalEstimatePercent:
+      logicalPercent === null ? null : Number(logicalPercent.toFixed(2)),
     eligible: eligibleNow.size,
-    previouslyEvaluatedEligible: previouslyEvaluatedNow.size,
     newEligibleCalls: newEligibleIds.size,
     newEligibleResultTokens,
-    requiredNewResultTokens: requiredResultTokens,
     forced: forceRefresh,
     shouldEvaluate,
     committed: state.decisions.size,
     deferredDropCalls: state.deferredDropCalls.size,
+    awaitingUsageRefresh: state.awaitingUsageRefresh,
   });
 
   if (!shouldEvaluate) {
@@ -1210,8 +1157,8 @@ async function evaluateAtTurnEnd(
     state,
     eligibleNow.size,
     logicalTokens,
-    effectivePercent,
-    forceRefresh ? ["forced"] : ["turn_end_threshold"],
+    boundary?.percent ?? null,
+    forceRefresh ? ["forced"] : ["pi_compaction_ceiling"],
   );
   diagnostics.record("evaluation_start", {
     turnIndex,
@@ -1220,10 +1167,15 @@ async function evaluateAtTurnEnd(
     logicalCalls: calls.length,
     committedBefore: state.decisions.size,
     logicalTokens,
-    effectivePercent: effectivePercent === null ? null : Number(effectivePercent.toFixed(2)),
+    usageTokens: boundary?.tokens ?? null,
+    usagePercent:
+      boundary?.percent === null || boundary?.percent === undefined
+        ? null
+        : Number(boundary.percent.toFixed(2)),
+    reserveTokens: piBoundary.reserveTokens,
+    ceilingTokens: boundary?.ceilingTokens ?? null,
     newEligibleCalls: newEligibleIds.size,
     newEligibleResultTokens,
-    requiredNewResultTokens: requiredResultTokens,
     timeoutMs: config.evaluationTimeoutMs,
   });
 
@@ -1244,7 +1196,16 @@ async function evaluateAtTurnEnd(
       logicalBefore,
       activeMaps.committed,
     );
-    const accepted = acceptsReduction(effectiveRatio, config.minReductionRatio);
+    const proposedApply = applyDecisionsDetailed(
+      logicalBefore,
+      activeMaps.committed,
+      decisionIds(activeMaps.committed),
+    );
+    const changedResults =
+      proposedApply.stats.droppedCalls +
+      proposedApply.stats.droppedResults +
+      proposedApply.stats.prunedResults;
+    const accepted = acceptsReduction(changedResults);
     const beforeMerge = new Map(state.decisions);
 
     if (accepted) {
@@ -1261,6 +1222,10 @@ async function evaluateAtTurnEnd(
       }
 
       persistLogicalState(pi, diagnostics, state, "turn_end_result_only");
+      // Pi's usage is still from the request that saw the pre-pruned context.
+      // Give the new logical history one provider request to produce fresh,
+      // authoritative usage before considering native threshold compaction.
+      state.awaitingUsageRefresh = true;
     }
 
     state.lastResult = evaluation.result;
@@ -1283,7 +1248,6 @@ async function evaluateAtTurnEnd(
       );
       const postProjection = projectMessages(applied.messages);
       const postTokens = rawTokenEstimate(postProjection.messages, ctx);
-      state.pendingReductionTokens = Math.max(0, logicalTokens - postTokens);
       state.lastLogicalTokens = postTokens;
       state.lastLogicalPercent =
         contextWindow && contextWindow > 0 ? (postTokens / contextWindow) * 100 : undefined;
@@ -1307,7 +1271,8 @@ async function evaluateAtTurnEnd(
       deferredDropCalls: state.deferredDropCalls.size,
       evaluatedEligibleBaseline: state.lastEvaluatedEligibleIds.size,
       newEligibleResultTokens,
-      requiredNewResultTokens: requiredResultTokens,
+      changedResults,
+      awaitingUsageRefresh: state.awaitingUsageRefresh,
       actions: countActions(evaluation.result),
       accepted,
     });
@@ -1358,20 +1323,13 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
     totalHttpTimeouts: 0,
     providerRequestCount: 0,
     deferredDropCalls: new Map(),
-    pendingReductionTokens: 0,
+    awaitingUsageRefresh: false,
     lastEvaluatedEligibleIds: new Set(),
   };
 
   diagnostics.record("extension_loaded", {
-    version: "0.6.4",
-    compactAtPercent: config.compactAtPercent,
-    nativeFallbackPercent: config.nativeFallbackPercent,
-    reevaluateMidPercent: config.reevaluateMidPercent,
-    reevaluateUrgentPercent: config.reevaluateUrgentPercent,
-    reevaluateLowResultTokens: config.reevaluateLowResultTokens,
-    reevaluateMidResultTokens: config.reevaluateMidResultTokens,
-    reevaluateUrgentResultTokens: config.reevaluateUrgentResultTokens,
-    minReductionRatio: config.minReductionRatio,
+    version: "0.7.0",
+    thresholdMode: "pi_real_usage_reserve",
     requestTimeoutMs: config.requestTimeoutMs,
     evaluationTimeoutMs: config.evaluationTimeoutMs,
     circuitBreakerFailures: config.circuitBreakerFailures,
@@ -1429,26 +1387,31 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
 
       const grossTokens = rawTokenEstimate(grossProjection.messages, ctx);
       const logicalTokens = rawTokenEstimate(logicalProjection.messages, ctx);
-      const usage = ctx.getContextUsage();
-      const contextWindow = usage?.contextWindow ?? ctx.model?.contextWindow;
+      const piBoundary = piCompactionBoundary(ctx);
+      const boundary = piBoundary.boundary;
+      const contextWindow = boundary?.contextWindow ?? ctx.model?.contextWindow;
       const grossPercent =
         contextWindow && contextWindow > 0 ? (grossTokens / contextWindow) * 100 : undefined;
       const logicalPercent =
         contextWindow && contextWindow > 0 ? (logicalTokens / contextWindow) * 100 : undefined;
-      const effectivePercent = usage?.percent ?? logicalPercent ?? null;
 
       state.lastRawTokens = grossTokens;
       state.lastRawPercent = grossPercent;
       state.lastLogicalTokens = logicalTokens;
       state.lastLogicalPercent = logicalPercent;
-      state.lastPiTokens = usage?.tokens ?? undefined;
-      state.lastPiPercent = effectivePercent ?? undefined;
+      state.lastPiTokens = boundary?.tokens ?? undefined;
+      state.lastPiPercent = boundary?.percent ?? undefined;
       state.lastContextWindow = contextWindow;
+      state.lastReserveTokens = piBoundary.reserveTokens;
+      state.lastCeilingTokens = boundary?.ceilingTokens;
+      state.lastAutoCompactionEnabled = piBoundary.autoCompactionEnabled;
       state.lastGrossToolCalls = rawIds.size;
       state.lastLogicalToolCalls = logicalCalls.length;
       state.lastApply = applied.stats;
-      state.active =
-        effectivePercent !== null && effectivePercent >= config.compactAtPercent;
+      state.active = Boolean(
+        piBoundary.autoCompactionEnabled &&
+          boundary?.overCeiling,
+      );
 
       state.lastContextOutcome =
         state.decisions.size > 0
@@ -1473,9 +1436,16 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
         contextWindow,
         grossPercent: grossPercent === undefined ? null : Number(grossPercent.toFixed(2)),
         logicalPercent: logicalPercent === undefined ? null : Number(logicalPercent.toFixed(2)),
-        piTokens: usage?.tokens ?? null,
-        piPercent: effectivePercent === null ? null : Number(effectivePercent.toFixed(2)),
-        compactAtPercent: config.compactAtPercent,
+        piTokens: boundary?.tokens ?? null,
+        piPercent:
+          boundary?.percent === null || boundary?.percent === undefined
+            ? null
+            : Number(boundary.percent.toFixed(2)),
+        reserveTokens: piBoundary.reserveTokens,
+        ceilingTokens: boundary?.ceilingTokens ?? null,
+        overCeiling: boundary?.overCeiling ?? null,
+        autoCompactionEnabled: piBoundary.autoCompactionEnabled,
+        awaitingUsageRefresh: state.awaitingUsageRefresh,
         ...applied.stats,
         durationMs: Date.now() - hookStarted,
       });
@@ -1499,48 +1469,36 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
 
   pi.on("session_before_compact", (event, ctx) => {
     try {
-      const hasKey = Boolean(process.env.TYPESAFE_API_KEY?.trim());
-      const remoteHealthy =
-        !breakerActive(state) &&
-        !state.lastError;
-      const logicalGuardAvailable = canGuardNativeThreshold({
-        enabled: state.enabled,
-        hasKey,
-        remoteHealthy,
-        committedDecisions: state.decisions.size,
-      });
-
-      const logical = logicalContextAtCompaction(
-        ctx,
-        state,
-      );
-
-      if (
+      const piBoundary = piCompactionBoundary(ctx);
+      const boundary = piBoundary.boundary;
+      const cancelThreshold =
+        state.enabled &&
         event.reason === "threshold" &&
-        shouldDelayNativeThreshold(
-          logical.percent,
-          config.nativeFallbackPercent,
-          logicalGuardAvailable,
-        )
-      ) {
+        shouldCancelNativeThreshold({
+          awaitingUsageRefresh: state.awaitingUsageRefresh,
+          usageTokens: boundary?.tokens ?? null,
+          ceilingTokens: boundary?.ceilingTokens ?? null,
+        });
+
+      if (cancelThreshold) {
         state.thresholdCancelledCount += 1;
         diagnostics.record("before_compact", {
           reason: event.reason,
-          outcome: "cancel_until_native_fallback",
+          outcome: state.awaitingUsageRefresh
+            ? "cancel_awaiting_real_usage_refresh"
+            : "cancel_real_usage_below_pi_ceiling",
           willRetry: event.willRetry,
-          logicalTokens: logical.tokens,
-          logicalMessages: logical.messages,
-          logicalPercent:
-            logical.percent === null ? null : Number(logical.percent.toFixed(2)),
-          jevTriggerPercent: config.compactAtPercent,
-          nativeFallbackPercent: config.nativeFallbackPercent,
+          usageTokens: boundary?.tokens ?? null,
+          usagePercent:
+            boundary?.percent === null || boundary?.percent === undefined
+              ? null
+              : Number(boundary.percent.toFixed(2)),
+          contextWindow: boundary?.contextWindow ?? null,
+          reserveTokens: piBoundary.reserveTokens,
+          ceilingTokens: boundary?.ceilingTokens ?? null,
+          awaitingUsageRefresh: state.awaitingUsageRefresh,
           committed: state.decisions.size,
           deferredDropCalls: state.deferredDropCalls.size,
-          remoteHealthy,
-          logicalGuardAvailable,
-          retryRemainingMs: Math.max(0, state.retryAfterMs - Date.now()),
-          breakerRemainingMs: Math.max(0, state.breakerUntilMs - Date.now()),
-          lastError: state.lastError,
           thresholdCancelledCount: state.thresholdCancelledCount,
         });
         updateStatus(ctx, state);
@@ -1566,21 +1524,21 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
         reason: event.reason,
         outcome:
           event.reason === "threshold"
-            ? "pass_native_fallback"
+            ? "pass_native_real_usage_above_pi_ceiling"
             : sanitized
               ? "pass_native_sanitized"
               : "pass_native",
         willRetry: event.willRetry,
-        hasKey,
-        remoteHealthy,
-        logicalGuardAvailable,
-        breaker: breakerActive(state),
+        usageTokens: boundary?.tokens ?? null,
+        usagePercent:
+          boundary?.percent === null || boundary?.percent === undefined
+            ? null
+            : Number(boundary.percent.toFixed(2)),
+        contextWindow: boundary?.contextWindow ?? null,
+        reserveTokens: piBoundary.reserveTokens,
+        ceilingTokens: boundary?.ceilingTokens ?? null,
+        awaitingUsageRefresh: state.awaitingUsageRefresh,
         lastError: state.lastError,
-        logicalTokens: logical.tokens,
-        logicalMessages: logical.messages,
-        logicalPercent:
-          logical.percent === null ? null : Number(logical.percent.toFixed(2)),
-        nativeFallbackPercent: config.nativeFallbackPercent,
         sanitized,
         thresholdPassedCount: state.thresholdPassedCount,
       });
@@ -1595,7 +1553,6 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
         outcome: "fail_open_to_native",
       });
       updateStatus(ctx, state);
-      // Never let a Jev integration error disable Pi's built-in safety net.
       return;
     }
   });
@@ -1609,10 +1566,9 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
     state.insufficient = false;
     state.lastError = undefined;
     state.lastResult = undefined;
-    state.pendingReductionTokens = 0;
+    state.awaitingUsageRefresh = false;
     state.lastEvaluatedEligibleIds.clear();
     state.lastNewEligibleResultTokens = undefined;
-    state.lastRequiredNewResultTokens = undefined;
     state.restoredDecisionCount = 0;
     persistLogicalState(pi, diagnostics, state, "native_compaction_tail");
     diagnostics.record("session_compact", {
@@ -1671,12 +1627,12 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
       : `unknown${rawWindow}`;
     const lines = [
       `fast-jev-compaction: enabled=${state.enabled} · at-threshold=${state.active} · evaluating=${state.evaluating}`,
-      `context: Pi≈${piContext} · Jev trigger=${config.compactAtPercent}% · adaptive=${config.reevaluateMidPercent}%/${config.reevaluateUrgentPercent}% · native fallback=${config.nativeFallbackPercent}%`,
-      `logical history≈${logicalContext} · calls=${state.lastLogicalToolCalls ?? "n/a"}; this is what the model and next Jev pass see`,
+      `context: Pi≈${piContext} · Pi ceiling=${state.lastCeilingTokens === undefined ? "unknown" : formatTokens(state.lastCeilingTokens)} · reserve=${state.lastReserveTokens === undefined ? "unknown" : formatTokens(state.lastReserveTokens)} · auto-compaction=${state.lastAutoCompactionEnabled ?? "unknown"}`,
+      `logical history estimate≈${logicalContext} · calls=${state.lastLogicalToolCalls ?? "n/a"}; diagnostic/Jev budgeting only, never used for threshold decisions`,
       `persisted Pi transcript≈${formatTokens(state.lastRawTokens ?? 0)}${rawWindow} (${(state.lastRawPercent ?? 0).toFixed(1)}%) · calls=${state.lastGrossToolCalls ?? "n/a"}; diagnostic only`,
       `committed decisions: ${state.decisions.size} total · drop_call=${committedDropCalls} · drop_result=${committedDropResults} · keep=${committedKeeps} · deferred drop_call=${state.deferredDropCalls.size} · restored=${state.restoredDecisionCount}`,
       `evaluations: ${state.evaluationSuccesses}/${state.evaluationAttempts} successful · Jev HTTP requests=${state.totalHttpRequests} total${state.lastEvaluationRequests !== undefined ? ` (last pass=${state.lastEvaluationRequests})` : ""}`,
-      `reevaluation: new result≈${formatTokens(state.lastNewEligibleResultTokens ?? 0)} tokens · required=${state.lastRequiredNewResultTokens === null || state.lastRequiredNewResultTokens === undefined ? "n/a" : formatTokens(state.lastRequiredNewResultTokens)} · baseline calls=${state.lastEvaluatedEligibleIds.size}`,
+      `reevaluation: new eligible result≈${formatTokens(state.lastNewEligibleResultTokens ?? 0)} tokens · baseline calls=${state.lastEvaluatedEligibleIds.size} · awaiting real usage refresh=${state.awaitingUsageRefresh}`,
       result
         ? `last pass: mode=${state.lastEvaluationMode ?? "n/a"} · effective reduction=${state.lastEffectiveReduction === undefined ? "n/a" : percent(state.lastEffectiveReduction)} · upstream=${percent(reductionRatio(result))} · eligible=${state.lastEvaluationEligible ?? "n/a"} · ${state.lastEvaluationMs ?? "n/a"}ms · Jev state≈${formatTokens(result.stats.stateTokens)} (${result.stats.stateStage || "n/a"})`
         : "last pass: n/a",
@@ -1703,24 +1659,26 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
       jevActive: state.active,
       jevError: state.lastError,
       committed: state.decisions.size,
+      awaitingUsageRefresh: state.awaitingUsageRefresh,
       lastApply: state.lastApply,
     });
   });
 
   pi.on("after_provider_response", (event) => {
-    // The provider response now carries usage for a request that already saw
-    // all decisions committed before this turn, so no pending correction from
-    // the previous turn is needed anymore.
-    state.pendingReductionTokens = 0;
     const durationMs = state.lastProviderRequestMs ? Date.now() - state.lastProviderRequestMs : undefined;
     state.lastProviderDurationMs = durationMs;
     state.lastProviderStatus = event.status;
+    const refreshedUsage =
+      typeof event.status === "number" && event.status >= 200 && event.status < 300;
+    if (refreshedUsage) state.awaitingUsageRefresh = false;
     diagnostics.record("provider_response", {
       requestId: state.providerRequestCount,
       status: event.status,
       durationMs,
       contextHookId: state.lastContextHookId,
       contextOutcome: state.lastContextOutcome,
+      refreshedUsage,
+      awaitingUsageRefresh: state.awaitingUsageRefresh,
     });
   });
 
@@ -1791,12 +1749,6 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
     const rawMessages = ctx.sessionManager.buildSessionContext().messages;
     const rawIds = rawToolCallIds(rawMessages);
     const before = new Map(state.decisions);
-    const beforeMessages = applyDecisionsDetailed(
-      rawMessages,
-      before,
-      decisionIds(before),
-    ).messages;
-    const beforeTokens = rawTokenEstimate(projectMessages(beforeMessages).messages, ctx);
     let promoted = 0;
 
     for (const [id, deferred] of state.deferredDropCalls) {
@@ -1817,7 +1769,7 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
         decisionIds(state.decisions),
       ).messages;
       const afterTokens = rawTokenEstimate(projectMessages(afterMessages).messages, ctx);
-      state.pendingReductionTokens += Math.max(0, beforeTokens - afterTokens);
+      state.awaitingUsageRefresh = true;
       state.lastLogicalTokens = afterTokens;
       const contextWindow = ctx.getContextUsage()?.contextWindow ?? ctx.model?.contextWindow;
       state.lastLogicalPercent =
@@ -1831,6 +1783,7 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
       promoted,
       committedBefore: before.size,
       committedAfter: state.decisions.size,
+      awaitingUsageRefresh: state.awaitingUsageRefresh,
     });
     updateStatus(ctx, state);
   });

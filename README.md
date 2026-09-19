@@ -4,6 +4,60 @@ A Pi package port of [`tamaratran/fast-jev-compaction`](https://github.com/tamar
 
 It uses TypeSafe Jev to decide, tool call by tool call, which old calls/results still need to remain in model context. User and assistant prose is not summarized or rewritten by this extension. Pi's persisted session transcript stays intact.
 
+## 0.7.0: Pi-native real-usage thresholds
+
+0.7.0 removes the extension's percentage/token scheduling thresholds entirely.
+
+Automatic Jev timing now follows Pi's own resolved compaction settings for the active model:
+
+```text
+safe input ceiling = contextWindow - compaction.reserveTokens
+```
+
+The extension reads Pi's global/project settings through Pi's public `SettingsManager`, including model-specific compaction overrides. This means the same policy scales automatically to 64k, 110k, 256k, or another context window without choosing new percentages.
+
+Automatic behavior:
+
+```text
+real Pi usage below safe input ceiling
+  -> no Jev evaluation
+
+real Pi usage above safe input ceiling + new eligible tool output
+  -> Jev gets one chance to prune
+
+Jev actually removes model-facing result content
+  -> cancel the pending Pi threshold compaction once
+  -> let the next provider request consume the pruned context
+  -> wait for Pi/provider usage to refresh
+
+fresh real usage back below the ceiling
+  -> continue normally
+
+fresh real usage still above the ceiling
+  -> Jev may run again only if new eligible tool output exists
+  -> otherwise Pi native compaction proceeds
+```
+
+Important consequences:
+
+- `75%`, `80%`, `84%`, and `87.5%` are no longer extension policy.
+- `2000/1000/1` re-evaluation gates are gone.
+- The 1% aggregate reduction floor is gone; any pass that actually removes model-facing result content is useful and may be committed.
+- Threshold decisions never use the local `estimateTokens()` heuristic. Local estimates remain only for Jev request budgeting and diagnostics.
+- Immediately after a successful Jev pass Pi's usage is necessarily stale, because no provider has consumed the new prompt yet. That is the single exception: the pending native threshold attempt is cancelled once, and the next successful provider response becomes authoritative.
+- Manual and overflow compactions are never blocked by this threshold policy.
+- If Pi auto-compaction is disabled, automatic Jev pressure evaluation is disabled too; `/jev-refresh` remains available.
+
+With Pi's default 16,384-token reserve, the same rule naturally produces different percentages:
+
+```text
+65,536 window   -> ceiling 49,152  (~75.0%)
+112,640 window  -> ceiling 96,256  (~85.5%)
+262,144 window  -> ceiling 245,760 (~93.8%)
+```
+
+Those percentages are consequences of Pi's configured token reserve, not constants in this package.
+
 ## 0.6.4: keep logical fallback through transient Jev failures
 
 0.6.4 fixes the premature native compactions observed in the first clean 0.6.3 run.
@@ -217,13 +271,6 @@ export TYPESAFE_API_KEY="..."
 ## Recommended starting configuration
 
 ```bash
-export PI_JEV_COMPACT_AT_PERCENT=75
-export PI_JEV_REEVALUATE_MID_PERCENT=80
-export PI_JEV_REEVALUATE_URGENT_PERCENT=84
-export PI_JEV_REEVALUATE_LOW_RESULT_TOKENS=2000
-export PI_JEV_REEVALUATE_MID_RESULT_TOKENS=1000
-export PI_JEV_REEVALUATE_URGENT_RESULT_TOKENS=1
-export PI_JEV_NATIVE_FALLBACK_PERCENT=87.5
 export PI_JEV_REQUEST_TIMEOUT_MS=8000
 export PI_JEV_EVALUATION_TIMEOUT_MS=12000
 export PI_JEV_DIAGNOSTICS=1
@@ -233,14 +280,6 @@ export PI_JEV_DIAGNOSTICS=1
 
 | Variable | Default | Meaning |
 | --- | ---: | --- |
-| `PI_JEV_COMPACT_AT_PERCENT` | `75` | Run the first pressure-triggered Jev evaluation at `turn_end` once Pi/provider context reaches this percentage |
-| `PI_JEV_REEVALUATE_MID_PERCENT` | `80` | Above this Pi/provider usage, use the mid-pressure new-result gate |
-| `PI_JEV_REEVALUATE_URGENT_PERCENT` | `84` | Above this Pi/provider usage, use the urgent new-result gate |
-| `PI_JEV_REEVALUATE_LOW_RESULT_TOKENS` | `2000` | New eligible tool-result tokens required for another pass between 75% and 80% |
-| `PI_JEV_REEVALUATE_MID_RESULT_TOKENS` | `1000` | New eligible tool-result tokens required between 80% and 84% |
-| `PI_JEV_REEVALUATE_URGENT_RESULT_TOKENS` | `1` | New eligible result tokens required at or above 84% |
-| `PI_JEV_NATIVE_FALLBACK_PERCENT` | `87.5` | Delay Pi threshold compaction to this calibrated logical-context percentage while Jev is healthy; overflow recovery is unaffected |
-| `PI_JEV_MIN_REDUCTION_RATIO` | `0.01` | Minimum effective reduction required to commit a pass; 1% avoids accepting effectively zero-change passes |
 | `PI_JEV_KEEP_THRESHOLD` | `0.5` | Jev keep-probability threshold |
 | `PI_JEV_PRESERVE_RECENT_MESSAGES` | `6` | Newest messages in the **logical** transcript protected from pruning |
 | `PI_JEV_MAX_STATE_TOKENS` | `25000` | Jev state budget |
@@ -272,8 +311,8 @@ export PI_JEV_DIAGNOSTICS=1
 Example fields:
 
 ```text
-context: Pi≈49.8k / 65.5k (76.0%) · calibrated pressure=79.1% · Jev trigger=75% · native fallback=87.5%
-logical history≈51.8k / 65.5k (79.1%) · calls=18; this is what the model and next Jev pass see
+context: Pi≈96.4k / 112.6k (85.6%) · Pi ceiling=96.3k · reserve=16.4k · auto-compaction=true
+logical history estimate≈101k / 112.6k (89.7%) · calls=18; diagnostic/Jev budgeting only, never used for threshold decisions
 persisted Pi transcript≈56.0k / 65.5k (85.4%) · calls=31; diagnostic only
 committed decisions: 20 total · drop_call=0 · drop_result=18 · keep=2 · deferred drop_call=11 · restored=0
 ```
