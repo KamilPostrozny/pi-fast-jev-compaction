@@ -1485,6 +1485,7 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
       const piBoundary = piCompactionBoundary(ctx);
       const boundary = piBoundary.boundary;
       const cancelThreshold =
+        state.enabled &&
         event.reason === "threshold" &&
         shouldCancelNativeThreshold({
           awaitingUsageRefresh: state.awaitingUsageRefresh,
