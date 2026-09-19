@@ -1787,7 +1787,7 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
         decisionIds(state.decisions),
       ).messages;
       const afterTokens = rawTokenEstimate(projectMessages(afterMessages).messages, ctx);
-      state.pendingReductionTokens += Math.max(0, beforeTokens - afterTokens);
+      state.awaitingUsageRefresh = true;
       state.lastLogicalTokens = afterTokens;
       const contextWindow = ctx.getContextUsage()?.contextWindow ?? ctx.model?.contextWindow;
       state.lastLogicalPercent =
@@ -1801,6 +1801,7 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
       promoted,
       committedBefore: before.size,
       committedAfter: state.decisions.size,
+      awaitingUsageRefresh: state.awaitingUsageRefresh,
     });
     updateStatus(ctx, state);
   });
