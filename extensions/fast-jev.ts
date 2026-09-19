@@ -20,8 +20,10 @@ import {
   acceptsReduction,
   activeRunAction,
   realContextBoundary,
+  reconcilePressureEpisode,
   shouldCancelNativeThreshold,
   shouldEvaluateAtTurnEnd,
+  type PressureEpisodeState,
   type RealContextBoundary,
 } from "./policy.ts";
 
@@ -156,7 +158,7 @@ interface RuntimeState {
   deferredDropCalls: Map<string, CachedDecision>;
   lastEvaluationMode?: "active_result_only";
   lastEffectiveReduction?: number;
-  awaitingUsageRefresh: boolean;
+  pressureEpisode: PressureEpisodeState;
   lastEvaluatedEligibleIds: Set<string>;
   lastNewEligibleResultTokens?: number;
   lastReserveTokens?: number;
@@ -597,7 +599,7 @@ function restoreLogicalState(
   state.deferredDropCalls.clear();
   state.lastEvaluatedEligibleIds.clear();
   state.lastNewEligibleResultTokens = undefined;
-  state.awaitingUsageRefresh = false;
+  state.pressureEpisode = "armed";
   state.restoredDecisionCount = restored.size;
   state.lastResult = undefined;
   state.lastEffectiveReduction = undefined;
@@ -1071,6 +1073,34 @@ async function evaluateAtTurnEnd(
   state.lastReserveTokens = piBoundary.reserveTokens;
   state.lastCeilingTokens = boundary?.ceilingTokens;
   state.lastAutoCompactionEnabled = piBoundary.autoCompactionEnabled;
+
+  const episodeBeforeReconcile = state.pressureEpisode;
+  state.pressureEpisode = reconcilePressureEpisode({
+    state: state.pressureEpisode,
+    overCeiling: boundary ? boundary.overCeiling : null,
+  });
+  if (episodeBeforeReconcile === "awaiting_validation") {
+    diagnostics.record("pressure_episode_validated", {
+      turnIndex,
+      outcome:
+        state.pressureEpisode === "armed"
+          ? "jev_restored_below_ceiling"
+          : "jev_failed_to_restore_ceiling",
+      usageTokens: boundary?.tokens ?? null,
+      ceilingTokens: boundary?.ceilingTokens ?? null,
+      overCeiling: boundary?.overCeiling ?? null,
+    });
+  } else if (
+    episodeBeforeReconcile === "exhausted" &&
+    state.pressureEpisode === "armed"
+  ) {
+    diagnostics.record("pressure_episode_rearmed", {
+      turnIndex,
+      usageTokens: boundary?.tokens ?? null,
+      ceilingTokens: boundary?.ceilingTokens ?? null,
+    });
+  }
+
   state.active = Boolean(
     piBoundary.autoCompactionEnabled &&
       boundary?.overCeiling,
@@ -1080,6 +1110,7 @@ async function evaluateAtTurnEnd(
   const shouldEvaluate = shouldEvaluateAtTurnEnd({
     autoCompactionEnabled: piBoundary.autoCompactionEnabled,
     overCeiling: boundary?.overCeiling ?? false,
+    pressureEpisode: state.pressureEpisode,
     forceRefresh,
     eligibleCalls: eligibleNow.size,
     newEligibleCalls: newEligibleIds.size,
@@ -1107,7 +1138,7 @@ async function evaluateAtTurnEnd(
     shouldEvaluate,
     committed: state.decisions.size,
     deferredDropCalls: state.deferredDropCalls.size,
-    awaitingUsageRefresh: state.awaitingUsageRefresh,
+    pressureEpisode: state.pressureEpisode,
   });
 
   if (!shouldEvaluate) {
@@ -1147,6 +1178,18 @@ async function evaluateAtTurnEnd(
     updateStatus(ctx, state);
     return;
   }
+
+  const automaticPressureAttempt =
+    !forceRefresh &&
+    piBoundary.autoCompactionEnabled &&
+    Boolean(boundary?.overCeiling) &&
+    state.pressureEpisode === "armed";
+
+  // One automatic attempt per pressure episode. If this attempt fails, returns
+  // no useful pruning, or the next real usage remains above the ceiling, native
+  // Pi compaction must win. An accepted pass temporarily moves to
+  // awaiting_validation below.
+  if (automaticPressureAttempt) state.pressureEpisode = "exhausted";
 
   state.evaluating = true;
   state.forceRefresh = false;
@@ -1223,9 +1266,9 @@ async function evaluateAtTurnEnd(
 
       persistLogicalState(pi, diagnostics, state, "turn_end_result_only");
       // Pi's usage is still from the request that saw the pre-pruned context.
-      // Give the new logical history one provider request to produce fresh,
-      // authoritative usage before considering native threshold compaction.
-      state.awaitingUsageRefresh = true;
+      // Give the new logical history exactly one provider request/turn to prove
+      // that real post-turn usage is back inside Pi's safe ceiling.
+      state.pressureEpisode = "awaiting_validation";
     }
 
     state.lastResult = evaluation.result;
@@ -1272,7 +1315,8 @@ async function evaluateAtTurnEnd(
       evaluatedEligibleBaseline: state.lastEvaluatedEligibleIds.size,
       newEligibleResultTokens,
       changedResults,
-      awaitingUsageRefresh: state.awaitingUsageRefresh,
+      pressureEpisode: state.pressureEpisode,
+      automaticPressureAttempt,
       actions: countActions(evaluation.result),
       accepted,
     });
@@ -1323,13 +1367,13 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
     totalHttpTimeouts: 0,
     providerRequestCount: 0,
     deferredDropCalls: new Map(),
-    awaitingUsageRefresh: false,
+    pressureEpisode: "armed",
     lastEvaluatedEligibleIds: new Set(),
   };
 
   diagnostics.record("extension_loaded", {
-    version: "0.7.0",
-    thresholdMode: "pi_real_usage_reserve",
+    version: "0.7.1",
+    thresholdMode: "pi_real_usage_pressure_episode",
     requestTimeoutMs: config.requestTimeoutMs,
     evaluationTimeoutMs: config.evaluationTimeoutMs,
     circuitBreakerFailures: config.circuitBreakerFailures,
@@ -1445,7 +1489,7 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
         ceilingTokens: boundary?.ceilingTokens ?? null,
         overCeiling: boundary?.overCeiling ?? null,
         autoCompactionEnabled: piBoundary.autoCompactionEnabled,
-        awaitingUsageRefresh: state.awaitingUsageRefresh,
+        pressureEpisode: state.pressureEpisode,
         ...applied.stats,
         durationMs: Date.now() - hookStarted,
       });
@@ -1475,7 +1519,7 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
         state.enabled &&
         event.reason === "threshold" &&
         shouldCancelNativeThreshold({
-          awaitingUsageRefresh: state.awaitingUsageRefresh,
+          pressureEpisode: state.pressureEpisode,
           usageTokens: boundary?.tokens ?? null,
           ceilingTokens: boundary?.ceilingTokens ?? null,
         });
@@ -1484,8 +1528,8 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
         state.thresholdCancelledCount += 1;
         diagnostics.record("before_compact", {
           reason: event.reason,
-          outcome: state.awaitingUsageRefresh
-            ? "cancel_awaiting_real_usage_refresh"
+          outcome: state.pressureEpisode === "awaiting_validation"
+            ? "cancel_awaiting_pressure_validation"
             : "cancel_real_usage_below_pi_ceiling",
           willRetry: event.willRetry,
           usageTokens: boundary?.tokens ?? null,
@@ -1496,7 +1540,7 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
           contextWindow: boundary?.contextWindow ?? null,
           reserveTokens: piBoundary.reserveTokens,
           ceilingTokens: boundary?.ceilingTokens ?? null,
-          awaitingUsageRefresh: state.awaitingUsageRefresh,
+          pressureEpisode: state.pressureEpisode,
           committed: state.decisions.size,
           deferredDropCalls: state.deferredDropCalls.size,
           thresholdCancelledCount: state.thresholdCancelledCount,
@@ -1537,7 +1581,7 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
         contextWindow: boundary?.contextWindow ?? null,
         reserveTokens: piBoundary.reserveTokens,
         ceilingTokens: boundary?.ceilingTokens ?? null,
-        awaitingUsageRefresh: state.awaitingUsageRefresh,
+        pressureEpisode: state.pressureEpisode,
         lastError: state.lastError,
         sanitized,
         thresholdPassedCount: state.thresholdPassedCount,
@@ -1566,7 +1610,7 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
     state.insufficient = false;
     state.lastError = undefined;
     state.lastResult = undefined;
-    state.awaitingUsageRefresh = false;
+    state.pressureEpisode = "armed";
     state.lastEvaluatedEligibleIds.clear();
     state.lastNewEligibleResultTokens = undefined;
     state.restoredDecisionCount = 0;
@@ -1632,7 +1676,7 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
       `persisted Pi transcript≈${formatTokens(state.lastRawTokens ?? 0)}${rawWindow} (${(state.lastRawPercent ?? 0).toFixed(1)}%) · calls=${state.lastGrossToolCalls ?? "n/a"}; diagnostic only`,
       `committed decisions: ${state.decisions.size} total · drop_call=${committedDropCalls} · drop_result=${committedDropResults} · keep=${committedKeeps} · deferred drop_call=${state.deferredDropCalls.size} · restored=${state.restoredDecisionCount}`,
       `evaluations: ${state.evaluationSuccesses}/${state.evaluationAttempts} successful · Jev HTTP requests=${state.totalHttpRequests} total${state.lastEvaluationRequests !== undefined ? ` (last pass=${state.lastEvaluationRequests})` : ""}`,
-      `reevaluation: new eligible result≈${formatTokens(state.lastNewEligibleResultTokens ?? 0)} tokens · baseline calls=${state.lastEvaluatedEligibleIds.size} · awaiting real usage refresh=${state.awaitingUsageRefresh}`,
+      `pressure episode: ${state.pressureEpisode} · new eligible result≈${formatTokens(state.lastNewEligibleResultTokens ?? 0)} tokens · baseline calls=${state.lastEvaluatedEligibleIds.size}`,
       result
         ? `last pass: mode=${state.lastEvaluationMode ?? "n/a"} · effective reduction=${state.lastEffectiveReduction === undefined ? "n/a" : percent(state.lastEffectiveReduction)} · upstream=${percent(reductionRatio(result))} · eligible=${state.lastEvaluationEligible ?? "n/a"} · ${state.lastEvaluationMs ?? "n/a"}ms · Jev state≈${formatTokens(result.stats.stateTokens)} (${result.stats.stateStage || "n/a"})`
         : "last pass: n/a",
@@ -1659,7 +1703,7 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
       jevActive: state.active,
       jevError: state.lastError,
       committed: state.decisions.size,
-      awaitingUsageRefresh: state.awaitingUsageRefresh,
+      pressureEpisode: state.pressureEpisode,
       lastApply: state.lastApply,
     });
   });
@@ -1668,17 +1712,13 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
     const durationMs = state.lastProviderRequestMs ? Date.now() - state.lastProviderRequestMs : undefined;
     state.lastProviderDurationMs = durationMs;
     state.lastProviderStatus = event.status;
-    const refreshedUsage =
-      typeof event.status === "number" && event.status >= 200 && event.status < 300;
-    if (refreshedUsage) state.awaitingUsageRefresh = false;
     diagnostics.record("provider_response", {
       requestId: state.providerRequestCount,
       status: event.status,
       durationMs,
       contextHookId: state.lastContextHookId,
       contextOutcome: state.lastContextOutcome,
-      refreshedUsage,
-      awaitingUsageRefresh: state.awaitingUsageRefresh,
+      pressureEpisode: state.pressureEpisode,
     });
   });
 
@@ -1769,7 +1809,7 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
         decisionIds(state.decisions),
       ).messages;
       const afterTokens = rawTokenEstimate(projectMessages(afterMessages).messages, ctx);
-      state.awaitingUsageRefresh = true;
+      state.pressureEpisode = "awaiting_validation";
       state.lastLogicalTokens = afterTokens;
       const contextWindow = ctx.getContextUsage()?.contextWindow ?? ctx.model?.contextWindow;
       state.lastLogicalPercent =
@@ -1783,7 +1823,7 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
       promoted,
       committedBefore: before.size,
       committedAfter: state.decisions.size,
-      awaitingUsageRefresh: state.awaitingUsageRefresh,
+      pressureEpisode: state.pressureEpisode,
     });
     updateStatus(ctx, state);
   });

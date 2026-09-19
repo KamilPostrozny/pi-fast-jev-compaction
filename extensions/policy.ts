@@ -1,5 +1,10 @@
 import type { CallAction } from "./fast-jev-core.ts";
 
+export type PressureEpisodeState =
+  | "armed"
+  | "awaiting_validation"
+  | "exhausted";
+
 export interface RealContextBoundary {
   tokens: number | null;
   contextWindow: number;
@@ -53,13 +58,46 @@ export function activeRunAction(action: CallAction): CallAction {
 }
 
 /**
+ * Reconcile one automatic Jev pressure episode using Pi's next authoritative
+ * post-turn context usage.
+ *
+ * - awaiting_validation + usage <= ceiling => the pass created enough runway;
+ *   re-arm Jev for a future ceiling crossing.
+ * - awaiting_validation + usage > ceiling (or usage unavailable) => the pass
+ *   did not restore a safe working set; exhaust this episode so native Pi
+ *   compaction wins.
+ * - exhausted + usage <= ceiling => some compaction/reduction resolved the
+ *   episode, so Jev may arm again.
+ */
+export function reconcilePressureEpisode(args: {
+  state: PressureEpisodeState;
+  overCeiling: boolean | null;
+}): PressureEpisodeState {
+  const { state, overCeiling } = args;
+
+  // This function is called from turn_end. If an accepted pass set
+  // awaiting_validation during the previous turn_end, reaching this call again
+  // already proves that one complete provider turn consumed the pruned prompt.
+  if (state === "awaiting_validation") {
+    return overCeiling === false ? "armed" : "exhausted";
+  }
+
+  if (state === "exhausted" && overCeiling === false) return "armed";
+  return state;
+}
+
+/**
  * Auto-evaluate only when Pi's own real context usage is past its configured
- * safe-input ceiling and there is genuinely new eligible tool output to score.
- * Manual refresh bypasses the ceiling but still requires an eligible call.
+ * safe-input ceiling, this pressure episode is armed, and there is genuinely
+ * new eligible tool output to score.
+ *
+ * Manual refresh bypasses both the ceiling and episode state, but still
+ * requires at least one eligible call.
  */
 export function shouldEvaluateAtTurnEnd(args: {
   autoCompactionEnabled: boolean;
   overCeiling: boolean;
+  pressureEpisode: PressureEpisodeState;
   forceRefresh: boolean;
   eligibleCalls: number;
   newEligibleCalls: number;
@@ -67,6 +105,7 @@ export function shouldEvaluateAtTurnEnd(args: {
   const {
     autoCompactionEnabled,
     overCeiling,
+    pressureEpisode,
     forceRefresh,
     eligibleCalls,
     newEligibleCalls,
@@ -74,25 +113,29 @@ export function shouldEvaluateAtTurnEnd(args: {
 
   if (eligibleCalls <= 0) return false;
   if (forceRefresh) return true;
-  return autoCompactionEnabled && overCeiling && newEligibleCalls > 0;
+  return (
+    autoCompactionEnabled &&
+    overCeiling &&
+    pressureEpisode === "armed" &&
+    newEligibleCalls > 0
+  );
 }
 
 /**
- * A successful Jev pass changes the next model-facing prompt, but Pi cannot
- * report the new real usage until a provider request has actually consumed it.
- * Cancel the pending threshold compaction once while waiting for that refresh.
+ * Cancel Pi's pending threshold compaction only while an accepted Jev pass is
+ * waiting for one real post-turn usage measurement, or when Pi asks to compact
+ * even though current real usage is already inside its own safe ceiling.
  *
- * Outside that one stale-usage window, trust Pi's real usage directly. If Pi
- * somehow asks to compact while its current usage is already below its own
- * ceiling, cancel the redundant request; otherwise let native compaction run.
+ * Once an episode is exhausted, usage above the ceiling is never cancelled:
+ * native compaction must be allowed to run.
  */
 export function shouldCancelNativeThreshold(args: {
-  awaitingUsageRefresh: boolean;
+  pressureEpisode: PressureEpisodeState;
   usageTokens: number | null;
   ceilingTokens: number | null;
 }): boolean {
-  const { awaitingUsageRefresh, usageTokens, ceilingTokens } = args;
-  if (awaitingUsageRefresh) return true;
+  const { pressureEpisode, usageTokens, ceilingTokens } = args;
+  if (pressureEpisode === "awaiting_validation") return true;
   return (
     usageTokens !== null &&
     ceilingTokens !== null &&

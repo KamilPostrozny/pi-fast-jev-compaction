@@ -71,30 +71,60 @@ test("normal scheduling uses Pi real usage while local estimate is diagnostic on
   assert.match(evaluateBlock, /boundary\?\.overCeiling/);
   assert.match(
     evaluateBlock,
-    /shouldEvaluateAtTurnEnd\(\{\s*autoCompactionEnabled:[\s\S]*overCeiling:/,
+    /shouldEvaluateAtTurnEnd\(\{\s*autoCompactionEnabled:[\s\S]*overCeiling:[\s\S]*pressureEpisode:/,
   );
+  assert.match(evaluateBlock, /reconcilePressureEpisode\(\{/);
+  assert.match(evaluateBlock, /state\.pressureEpisode = "exhausted"/);
+  assert.match(evaluateBlock, /state\.pressureEpisode = "awaiting_validation"/);
   assert.doesNotMatch(evaluateBlock, /effectivePercent/);
 });
 
-test("native threshold uses real usage and one stale-usage refresh exception", () => {
+test("automatic pressure attempt is consumed before remote evaluation starts", () => {
+  const evaluateBlock = blockBetween(
+    "async function evaluateAtTurnEnd",
+    "export default function fastJevCompaction",
+  );
+  const exhaustAt = evaluateBlock.indexOf('state.pressureEpisode = "exhausted"');
+  const remoteAt = evaluateBlock.indexOf("await evaluate(");
+  assert.ok(exhaustAt >= 0);
+  assert.ok(remoteAt > exhaustAt);
+});
+
+test("native threshold cancels only the single awaiting-validation attempt", () => {
   const compactHook = blockBetween(
     'pi.on("session_before_compact"',
     'pi.on("session_compact"',
   );
   assert.match(compactHook, /piCompactionBoundary\(ctx\)/);
   assert.match(compactHook, /shouldCancelNativeThreshold\(\{/);
-  assert.match(compactHook, /awaitingUsageRefresh/);
+  assert.match(compactHook, /pressureEpisode:\s*state\.pressureEpisode/);
+  assert.match(compactHook, /cancel_awaiting_pressure_validation/);
   assert.doesNotMatch(compactHook, /logicalContextAtCompaction/);
   assert.doesNotMatch(compactHook, /nativeFallbackPercent/);
 });
 
-test("successful provider response clears stale usage marker", () => {
+test("provider response does not decide pressure validation before turn_end", () => {
   const block = blockBetween(
     'pi.on("after_provider_response"',
     'pi.on("turn_start"',
   );
-  assert.match(block, /refreshedUsage/);
-  assert.match(block, /state\.awaitingUsageRefresh = false/);
+  assert.match(block, /pressureEpisode: state\.pressureEpisode/);
+  assert.doesNotMatch(block, /reconcilePressureEpisode/);
+  assert.doesNotMatch(block, /state\.pressureEpisode = "armed"/);
+  assert.doesNotMatch(block, /state\.pressureEpisode = "exhausted"/);
+});
+
+test("next post-turn real usage decides whether Jev re-arms or native compaction wins", () => {
+  const evaluateBlock = blockBetween(
+    "async function evaluateAtTurnEnd",
+    "export default function fastJevCompaction",
+  );
+  const reconcileAt = evaluateBlock.indexOf("reconcilePressureEpisode");
+  const scheduleAt = evaluateBlock.indexOf("shouldEvaluateAtTurnEnd");
+  assert.ok(reconcileAt >= 0);
+  assert.ok(scheduleAt > reconcileAt);
+  assert.match(evaluateBlock, /jev_restored_below_ceiling/);
+  assert.match(evaluateBlock, /jev_failed_to_restore_ceiling/);
 });
 
 test("0.6 grounding/read-pinning experiments remain absent", () => {

@@ -4,6 +4,52 @@ A Pi package port of [`tamaratran/fast-jev-compaction`](https://github.com/tamar
 
 It uses TypeSafe Jev to decide, tool call by tool call, which old calls/results still need to remain in model context. User and assistant prose is not summarized or rewritten by this extension. Pi's persisted session transcript stays intact.
 
+## 0.7.1: single-attempt pressure episodes
+
+0.7.1 fixes a failure mode found on both 65k and 112k contexts: once usage was above Pi's safe-input ceiling, 0.7.0 could run Jev again after every new tool result. Even tiny one-result pruning was enough to cancel native compaction again, causing repeated source loss, llama.cpp prompt-cache invalidation, and eventual overflow.
+
+Automatic pressure handling is now an explicit state machine:
+
+```text
+ARMED
+  real Pi usage <= ceiling
+
+  usage crosses above ceiling
+        |
+        v
+JEV ATTEMPT
+  exactly one automatic Jev pass for this pressure episode
+
+  accepted pruning
+        |
+        v
+AWAITING VALIDATION
+  cancel this pending Pi threshold compaction once
+  let one provider turn run on the pruned prompt
+  validate using Pi's real post-turn usage, including new tool results
+
+        | usage <= ceiling
+        +------------------> ARMED
+
+        | usage > ceiling (or usage unavailable)
+        v
+EXHAUSTED
+  no more automatic Jev evaluations in this pressure episode
+  do not cancel Pi threshold compaction
+  native compaction wins
+
+  usage later returns below ceiling or native compaction completes
+        |
+        v
+ARMED
+```
+
+There are still no percentage/token heuristics in this policy. Success means only one thing: the next authoritative post-turn Pi usage is back inside Pi's configured safe-input ceiling.
+
+Manual `/jev-refresh` remains an explicit override of an exhausted episode.
+
+This preserves 0.7.0's real-usage/reserve scaling while preventing micro-pruning loops and repeated prompt-prefix invalidation.
+
 ## 0.7.0: Pi-native real-usage thresholds
 
 0.7.0 removes the extension's percentage/token scheduling thresholds entirely.
