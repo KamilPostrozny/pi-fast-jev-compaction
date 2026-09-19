@@ -1,5 +1,7 @@
 import type { CallAction } from "./fast-jev-core.ts";
 
+export const PRESSURE_REARM_PERCENT = 70;
+
 export type PressureEpisodeState =
   | "armed"
   | "awaiting_validation"
@@ -61,28 +63,37 @@ export function activeRunAction(action: CallAction): CallAction {
  * Reconcile one automatic Jev pressure episode using Pi's next authoritative
  * post-turn context usage.
  *
- * - awaiting_validation + usage <= ceiling => the pass created enough runway;
- *   re-arm Jev for a future ceiling crossing.
- * - awaiting_validation + usage > ceiling (or usage unavailable) => the pass
- *   did not restore a safe working set; exhaust this episode so native Pi
- *   compaction wins.
- * - exhausted + usage <= ceiling => some compaction/reduction resolved the
- *   episode, so Jev may arm again.
+ * - awaiting_validation + usage <= re-arm threshold => the pass created
+ *   enough runway; re-arm Jev for a future ceiling crossing.
+ * - awaiting_validation + usage > re-arm threshold (or usage unavailable) =>
+ *   keep the pruning but exhaust this episode, preventing edge oscillation.
+ * - exhausted + usage <= re-arm threshold => some compaction/reduction created
+ *   enough hysteresis, so Jev may arm again.
  */
 export function reconcilePressureEpisode(args: {
   state: PressureEpisodeState;
-  overCeiling: boolean | null;
+  usagePercent: number | null;
+  rearmPercent?: number;
 }): PressureEpisodeState {
-  const { state, overCeiling } = args;
+  const { state, usagePercent, rearmPercent = PRESSURE_REARM_PERCENT } = args;
+  const canRearm =
+    usagePercent !== null &&
+    Number.isFinite(usagePercent) &&
+    usagePercent <= rearmPercent;
 
   // This function is called from turn_end. If an accepted pass set
   // awaiting_validation during the previous turn_end, reaching this call again
   // already proves that one complete provider turn consumed the pruned prompt.
+  //
+  // Do not re-arm merely because usage slipped below Pi's native ceiling.
+  // Require a lower hysteresis boundary so marginal edge prunes cannot chatter
+  // around the compaction threshold and repeatedly invalidate llama.cpp's
+  // cached prompt prefix.
   if (state === "awaiting_validation") {
-    return overCeiling === false ? "armed" : "exhausted";
+    return canRearm ? "armed" : "exhausted";
   }
 
-  if (state === "exhausted" && overCeiling === false) return "armed";
+  if (state === "exhausted" && canRearm) return "armed";
   return state;
 }
 
