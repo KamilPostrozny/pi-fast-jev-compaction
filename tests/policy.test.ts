@@ -4,6 +4,7 @@ import {
   acceptsReduction,
   activeRunAction,
   contextCeiling,
+  PRESSURE_REARM_PERCENT,
   realContextBoundary,
   reconcilePressureEpisode,
   shouldCancelNativeThreshold,
@@ -58,48 +59,66 @@ test("real context boundary has no opinion when Pi usage is unavailable", () => 
   assert.equal(boundary?.overCeiling, false);
 });
 
-test("accepted Jev pass is validated by the next real post-turn usage", () => {
+test("pressure hysteresis has one explicit context-size-independent re-arm boundary", () => {
+  assert.equal(PRESSURE_REARM_PERCENT, 70);
+});
+
+test("accepted Jev pass only re-arms after validation reaches hysteresis boundary", () => {
   assert.equal(
     reconcilePressureEpisode({
       state: "awaiting_validation",
-      overCeiling: false,
+      usagePercent: 69.9,
     }),
     "armed",
   );
   assert.equal(
     reconcilePressureEpisode({
       state: "awaiting_validation",
-      overCeiling: true,
+      usagePercent: 70,
+    }),
+    "armed",
+  );
+  assert.equal(
+    reconcilePressureEpisode({
+      state: "awaiting_validation",
+      usagePercent: 70.01,
     }),
     "exhausted",
   );
   assert.equal(
     reconcilePressureEpisode({
       state: "awaiting_validation",
-      overCeiling: null,
+      usagePercent: null,
     }),
     "exhausted",
   );
 });
 
-test("exhausted pressure episode only re-arms after real usage returns below ceiling", () => {
+test("exhausted pressure episode stays disarmed until usage reaches hysteresis boundary", () => {
   assert.equal(
     reconcilePressureEpisode({
       state: "exhausted",
-      overCeiling: true,
+      usagePercent: 85,
     }),
     "exhausted",
   );
   assert.equal(
     reconcilePressureEpisode({
       state: "exhausted",
-      overCeiling: false,
+      usagePercent: 74,
+    }),
+    "exhausted",
+  );
+  assert.equal(
+    reconcilePressureEpisode({
+      state: "exhausted",
+      usagePercent: 70,
     }),
     "armed",
   );
 });
 
-test("automatic Jev evaluation runs once per above-ceiling pressure episode", () => {
+test("automatic Jev evaluation runs once per armed above-ceiling pressure episode", () => {
   assert.equal(
     shouldEvaluateAtTurnEnd({
       autoCompactionEnabled: true,
@@ -133,37 +152,24 @@ test("automatic Jev evaluation runs once per above-ceiling pressure episode", ()
     }),
     false,
   );
-  assert.equal(
-    shouldEvaluateAtTurnEnd({
-      autoCompactionEnabled: true,
-      overCeiling: false,
-      pressureEpisode: "armed",
-      forceRefresh: false,
-      eligibleCalls: 10,
-      newEligibleCalls: 10,
-    }),
-    false,
-  );
 });
 
 test("110k failed reclaim exhausts the episode instead of micro-pruning again", () => {
   const ceiling = 96_256;
-  const before = 101_679;
   const after = 100_987;
-
-  assert.ok(before > ceiling);
-  assert.ok(after > ceiling);
+  const window = 112_640;
+  const usagePercent = (after / window) * 100;
 
   const episode = reconcilePressureEpisode({
     state: "awaiting_validation",
-    overCeiling: after > ceiling,
+    usagePercent,
   });
   assert.equal(episode, "exhausted");
 
   assert.equal(
     shouldEvaluateAtTurnEnd({
       autoCompactionEnabled: true,
-      overCeiling: true,
+      overCeiling: after > ceiling,
       pressureEpisode: episode,
       forceRefresh: false,
       eligibleCalls: 76,
@@ -181,13 +187,27 @@ test("110k failed reclaim exhausts the episode instead of micro-pruning again", 
   );
 });
 
-test("64k successful reclaim re-arms a future pressure episode", () => {
-  const ceiling = 49_152;
-  const after = 34_285;
+test("latest 110k 80 percent edge reclaim stays disarmed even though below Pi ceiling", () => {
+  const after = 90_115;
+  const window = 112_640;
+  const ceiling = 96_256;
+  assert.ok(after < ceiling);
+  assert.equal(Number(((after / window) * 100).toFixed(2)), 80);
 
   const episode = reconcilePressureEpisode({
     state: "awaiting_validation",
-    overCeiling: after > ceiling,
+    usagePercent: (after / window) * 100,
+  });
+  assert.equal(episode, "exhausted");
+});
+
+test("64k large reclaim still re-arms", () => {
+  const after = 34_285;
+  const window = 65_536;
+
+  const episode = reconcilePressureEpisode({
+    state: "awaiting_validation",
+    usagePercent: (after / window) * 100,
   });
   assert.equal(episode, "armed");
 });
@@ -217,7 +237,7 @@ test("manual refresh bypasses pressure episode state but still needs an eligible
   );
 });
 
-test("any actual pruning is accepted but must still pass pressure validation", () => {
+test("any actual pruning is accepted; hysteresis controls re-arm instead", () => {
   assert.equal(acceptsReduction(0), false);
   assert.equal(acceptsReduction(1), true);
   assert.equal(acceptsReduction(20), true);

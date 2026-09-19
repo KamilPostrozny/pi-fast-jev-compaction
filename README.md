@@ -4,6 +4,32 @@ A Pi package port of [`tamaratran/fast-jev-compaction`](https://github.com/tamar
 
 It uses TypeSafe Jev to decide, tool call by tool call, which old calls/results still need to remain in model context. User and assistant prose is not summarized or rewritten by this extension. Pi's persisted session transcript stays intact.
 
+## 0.7.2: pressure re-arm hysteresis
+
+0.7.2 keeps 0.7.1's one-attempt pressure episodes and adds one simple hysteresis rule: an automatic Jev episode is not re-armed until Pi's real context usage is at or below **70%**.
+
+Pi's own reserve-derived ceiling still decides when Jev gets its automatic chance and when native compaction is due. The 70% boundary only decides whether a successful prune created enough runway to permit another Jev episode later.
+
+```text
+cross Pi ceiling
+  -> one Jev attempt
+  -> cancel native threshold once
+  -> one validation turn
+
+validation usage <= 70%
+  -> ARMED again
+
+validation usage > 70%
+  -> keep accepted pruning
+  -> EXHAUSTED / no more automatic Jev
+  -> continue normally if still below Pi ceiling
+  -> when Pi ceiling is reached again, native compaction wins
+```
+
+This prevents edge oscillation such as a tiny prune moving usage from 86% to 84%, re-arming Jev, then triggering another prefix-invalidating pass a few turns later. There is still no minimum reduction percentage: even a small accepted prune may remain useful, but it no longer earns another automatic Jev episode unless the real post-turn context reaches the lower hysteresis boundary.
+
+The 70% re-arm value is context-size independent. With Pi's default reserve it gives a real dead band on 65k contexts (native ceiling ~75%) and a larger dead band on 112k contexts (native ceiling ~85.5%).
+
 ## 0.7.1: single-attempt pressure episodes
 
 0.7.1 fixes a failure mode found on both 65k and 112k contexts: once usage was above Pi's safe-input ceiling, 0.7.0 could run Jev again after every new tool result. Even tiny one-result pruning was enough to cancel native compaction again, causing repeated source loss, llama.cpp prompt-cache invalidation, and eventual overflow.
