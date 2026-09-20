@@ -1,7 +1,5 @@
 import type { CallAction } from "./fast-jev-core.ts";
 
-export const PRESSURE_REARM_PERCENT = 70;
-
 export type PressureEpisodeState =
   | "armed"
   | "awaiting_validation"
@@ -12,6 +10,8 @@ export interface RealContextBoundary {
   contextWindow: number;
   reserveTokens: number;
   ceilingTokens: number;
+  rearmTokens: number;
+  hysteresisMarginTokens: number;
   percent: number | null;
   overCeiling: boolean;
 }
@@ -30,7 +30,13 @@ export function realContextBoundary(args: {
   const { tokens, contextWindow, reserveTokens } = args;
   if (!contextWindow || !Number.isFinite(contextWindow) || contextWindow <= 0) return null;
 
-  const ceilingTokens = contextCeiling(contextWindow, reserveTokens);
+  const reserve = Math.max(0, Number.isFinite(reserveTokens) ? reserveTokens : 0);
+  const ceilingTokens = contextCeiling(contextWindow, reserve);
+  // Round the re-arm boundary down, never towards the native ceiling.
+  const rearmTokens = Math.max(
+    0,
+    Math.floor(ceilingTokens - Math.min(contextWindow * 0.05, reserve / 2)),
+  );
   const realTokens =
     tokens !== null && tokens !== undefined && Number.isFinite(tokens)
       ? Math.max(0, tokens)
@@ -39,15 +45,65 @@ export function realContextBoundary(args: {
   return {
     tokens: realTokens,
     contextWindow,
-    reserveTokens: Math.max(0, Number.isFinite(reserveTokens) ? reserveTokens : 0),
+    reserveTokens: reserve,
     ceilingTokens,
+    rearmTokens,
+    hysteresisMarginTokens: ceilingTokens - rearmTokens,
     percent: realTokens === null ? null : (realTokens / contextWindow) * 100,
     overCeiling: realTokens !== null && realTokens > ceilingTokens,
   };
 }
 
+/** Pi skips failed/all-zero assistant usage and otherwise falls back to older usage. */
+export function hasFreshAssistantUsage(message: {
+  role?: string;
+  stopReason?: string;
+  usage?: {
+    totalTokens?: number;
+    input?: number;
+    output?: number;
+    cacheRead?: number;
+    cacheWrite?: number;
+  };
+}): boolean {
+  if (
+    message.role !== "assistant" ||
+    !["stop", "toolUse", "length"].includes(message.stopReason ?? "")
+  ) return false;
+  const usage = message.usage;
+  if (!usage) return false;
+  const tokens = usage.totalTokens || (
+    (usage.input ?? 0) + (usage.output ?? 0) +
+    (usage.cacheRead ?? 0) + (usage.cacheWrite ?? 0)
+  );
+  return Number.isFinite(tokens) && tokens > 0;
+}
+
 export function acceptsReduction(changedResults: number): boolean {
   return Number.isFinite(changedResults) && changedResults > 0;
+}
+
+/** A cost gate, not a substitute for Pi usage or next-turn validation. */
+export function pruningAcceptance(args: {
+  changedResults: number;
+  estimatedSavedTokens: number;
+  automatic: boolean;
+  boundary: RealContextBoundary | null;
+}): { accepted: boolean; reason: string; minimumSavedTokens: number | null } {
+  const minimumSavedTokens = args.automatic
+    ? args.boundary?.hysteresisMarginTokens ?? null
+    : 0;
+  if (!acceptsReduction(args.changedResults)) {
+    return { accepted: false, reason: "no_actual_pruning", minimumSavedTokens };
+  }
+  if (!args.automatic) {
+    return { accepted: true, reason: "manual_override", minimumSavedTokens };
+  }
+  if (minimumSavedTokens === null || !Number.isFinite(args.estimatedSavedTokens) ||
+      args.estimatedSavedTokens <= 0 || args.estimatedSavedTokens < minimumSavedTokens) {
+    return { accepted: false, reason: "insufficient_estimated_savings", minimumSavedTokens };
+  }
+  return { accepted: true, reason: "worthwhile_estimated_savings", minimumSavedTokens };
 }
 
 /**
@@ -72,23 +128,24 @@ export function activeRunAction(action: CallAction): CallAction {
  */
 export function reconcilePressureEpisode(args: {
   state: PressureEpisodeState;
-  usagePercent: number | null;
-  rearmPercent?: number;
+  // Pass null after a failed turn: getContextUsage() may still report stale usage.
+  boundary: RealContextBoundary | null;
 }): PressureEpisodeState {
-  const { state, usagePercent, rearmPercent = PRESSURE_REARM_PERCENT } = args;
+  const { state, boundary } = args;
+  const tokens = boundary?.tokens;
   const canRearm =
-    usagePercent !== null &&
-    Number.isFinite(usagePercent) &&
-    usagePercent <= rearmPercent;
+    boundary !== null &&
+    tokens !== null &&
+    tokens !== undefined &&
+    Number.isFinite(tokens) &&
+    tokens <= boundary.rearmTokens &&
+    // Zero reserve has no dead band; a zero ceiling has no safe input space.
+    // Neither case may re-arm at or above Pi's ceiling.
+    tokens < boundary.ceilingTokens;
 
-  // This function is called from turn_end. If an accepted pass set
-  // awaiting_validation during the previous turn_end, reaching this call again
-  // already proves that one complete provider turn consumed the pruned prompt.
-  //
-  // Do not re-arm merely because usage slipped below Pi's native ceiling.
-  // Require a lower hysteresis boundary so marginal edge prunes cannot chatter
-  // around the compaction threshold and repeatedly invalidate llama.cpp's
-  // cached prompt prefix.
+  // Require meaningful headroom relative to Pi's ceiling, not a fixed fraction
+  // of the entire context window. Missing/failing validation consumes the
+  // attempt rather than repeatedly delaying native compaction.
   if (state === "awaiting_validation") {
     return canRearm ? "armed" : "exhausted";
   }

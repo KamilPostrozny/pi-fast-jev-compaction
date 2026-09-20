@@ -52,9 +52,12 @@ test("drop_result uses an explicit pruned marker without retaining a source pref
   assert.doesNotMatch(source, /text\.slice\(0,\s*headChars\)/);
 });
 
-test("pressure hysteresis uses one explicit re-arm percentage", () => {
-  assert.match(source, /PRESSURE_REARM_PERCENT/);
-  assert.match(source, /rearmPercent:/);
+test("pressure hysteresis uses the resolved token boundary and logs it", () => {
+  assert.doesNotMatch(source, /PRESSURE_REARM_PERCENT/);
+  assert.match(source, /rearmTokens: boundary\?\.rearmTokens/);
+  assert.match(source, /hysteresisMarginTokens: boundary\?\.hysteresisMarginTokens/);
+  assert.match(source, /boundary: freshUsage \? boundary : null/);
+  assert.match(source, /hasFreshAssistantUsage\(message\)/);
 });
 
 test("automatic trigger and native ceiling still come from Pi compaction settings", () => {
@@ -67,7 +70,7 @@ test("automatic trigger and native ceiling still come from Pi compaction setting
   assert.doesNotMatch(source, /minReductionRatio/);
 });
 
-test("normal scheduling uses Pi real usage while local estimate is diagnostic only", () => {
+test("normal scheduling uses Pi real usage, not local context estimates", () => {
   const evaluateBlock = blockBetween(
     "async function evaluateAtTurnEnd",
     "export default function fastJevCompaction",
@@ -143,6 +146,6 @@ test("0.6 grounding/read-pinning experiments remain absent", () => {
 
 test("Pi adapter TypeScript parses after type stripping", () => {
   assert.doesNotThrow(() => {
-    stripTypeScriptTypes(source, { mode: "transform" });
+    stripTypeScriptTypes(source, { mode: "strip" });
   });
 });

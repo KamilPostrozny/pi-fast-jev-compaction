@@ -1,7 +1,7 @@
 {
   "name": "pi-fast-jev-compaction",
-  "version": "0.7.2",
-  "description": "Jev pruning for Pi with real-usage pressure episodes and 70% re-arm hysteresis.",
+  "version": "0.7.4",
+  "description": "Jev pruning for Pi with ceiling-relative hysteresis, a pruning cost gate, and bounded task-state excerpts.",
   "type": "module",
   "license": "MIT",
   "keywords": [

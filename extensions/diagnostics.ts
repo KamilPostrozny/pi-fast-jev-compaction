@@ -158,6 +158,11 @@ export function summarizeDiagnostic(record: DiagnosticRecord): string {
     "contextHookId",
     "contextOutcome",
     "reduction",
+    "accepted",
+    "acceptanceReason",
+    "estimatedSavedTokens",
+    "minimumSavedTokens",
+    "retainedTaskExcerpts",
     "error",
   ]) {
     const value = record[key];

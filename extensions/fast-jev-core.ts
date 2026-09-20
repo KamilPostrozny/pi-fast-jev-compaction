@@ -232,7 +232,9 @@ function parseJevResponse(status: number, ok: boolean, text: string): JevRespons
 
 function noulAnswer(answers: Record<string, JevAnswer>, name: string): number {
   const answer = answers[name];
-  if (!answer || !("noul" in answer) || typeof answer.noul !== "number" || !Number.isFinite(answer.noul)) {
+  if (!answer || typeof answer !== "object" || !("noul" in answer) ||
+      typeof answer.noul !== "number" || !Number.isFinite(answer.noul) ||
+      answer.noul < 0 || answer.noul > 1) {
     throw new Error(`Invalid Jev answer for ${name}`);
   }
   return answer.noul;

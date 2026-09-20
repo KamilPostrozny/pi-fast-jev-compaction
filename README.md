@@ -4,6 +4,96 @@ A Pi package port of [`tamaratran/fast-jev-compaction`](https://github.com/tamar
 
 It uses TypeSafe Jev to decide, tool call by tool call, which old calls/results still need to remain in model context. User and assistant prose is not summarized or rewritten by this extension. Pi's persisted session transcript stays intact.
 
+## 0.7.4: pruning cost gate and bounded task notes
+
+The 0.7.3 pressure policy is unchanged: one attempt above Pi's `contextWindow - reserveTokens`, with re-arming below `ceiling - min(window * 0.05, reserve / 2)`. This release addresses expensive marginal pruning and lost task facts observed in a two-hour coding session.
+
+### Reject low-value automatic pruning before changing the prompt
+
+An automatic proposal must both change actual results and save at least the **resolved hysteresis gap** in estimated net tool-result tokens. At a 112,640-token window and 16,384 reserve, that is **5,632 estimated tokens**. There is no fixed percentage-of-history reduction floor.
+
+Savings are measured between the **already-pruned logical results** and the proposed results, subtracting markers and retained task notes. Previously deleted content and Jev's hypothetical full-call deletions do not count. A rejected proposal commits nothing, defers no call deletions, consumes its automatic pressure attempt, and lets native compaction proceed. `/jev-refresh` remains an override accepting any actual pruning.
+
+This is an efficiency heuristic, not a tokenizer-accurate promise or a cache-cost predictor. Local estimates are used only for the savings gate/Jev budgets/diagnostics; **Pi usage still exclusively controls pressure, native cancellation, and post-turn validation**. A positive saving is required even when a zero reserve produces a zero margin. No new token-growth override is introduced.
+
+### Retain focused status-document excerpts
+
+When pruning a successful `read` of a Markdown file whose basename contains a separate `status`, `handoff`, or `progress` component (for example `docs/increment-3-status.md`), the adapter can retain:
+
+1. Constraints, known issues/failures, open edges, blockers, and validation exceptions.
+2. The current/next task and next steps.
+3. Task state, validation, and progress sections if budget remains.
+
+These are deterministic excerpts from Markdown headings, not an LLM summary. Complete paragraphs/bullets are retained rather than cutting off qualifications such as “not a regression” or “out of scope.” Code fences and oversized blocks are skipped. Selection is bounded to **2,400 characters per result and 7,200 total across committed excerpts**; newer eligible reads are considered first within each pass. A small relevant document may remain intact rather than being enlarged by a pruning marker.
+
+Excerpts remain in the original tool-result position, labeled as **historical notes, not current file contents** when the result is shortened. They are persisted with accepted decisions, survive reload/re-scoring, are not promoted to full deletion at `agent_end`, and are supplied to native summarization. Already deleted content is never recovered to create an excerpt. No hidden reminder, extra model call, or blanket source-read pinning is added. Ordinary source files and README/AGENTS files keep the explicit rerun-marker behavior.
+
+Limitations: this recognizes a narrow set of English Markdown headings and filenames; arbitrary command output, partial reads without the relevant heading, and facts outside the budget may still be lost. Committed excerpts stay fixed until their calls leave the active branch; they do not constitute a continuously updated task database. Native summaries may still omit facts. Re-read the actual status document before editing it or treating its contents as current.
+
+### Understand the scorer before tuning it
+
+Upstream Jev **does not see tool-result bodies**. It receives call inputs plus output size/success/error metadata, alongside fitted conversation text. Its unchanged result question asks whether the full output must remain verbatim and “re-running the tool would not do.” Therefore an all-drop pass does not demonstrate content-aware evaluation of every result's facts.
+
+The 0.5 scoring threshold, scoring questions, state budgets, and six-message protection remain unchanged. Tests now verify probability parsing and call/result mapping; malformed or out-of-range probabilities fail open.
+
+New diagnostics (without logging result bodies or goal text):
+
+- `evaluation_scores`: probability distributions, repeated-value counts, per-tool summaries, and separate previously-pruned vs other scored calls. Pinned calls are excluded from score distributions.
+- `evaluation_goal`: goal source/length, source prompt lengths, and how many prompts were truncated by the existing 500-character inference rule.
+- `evaluation_success`: `estimatedSavedTokens`, `minimumSavedTokens`, `acceptanceReason`, and proposed/committed task-excerpt counts and character totals. Success here means the evaluation completed; inspect `accepted` for whether pruning was committed.
+- `/jev-status` and `/jev-diagnostics`: savings-gate outcome and retained-note budget.
+
+Start fresh workers (or `/reload` idle sessions) to load **0.7.4**, ensure each inherits `TYPESAFE_API_KEY`, and preserve the diagnostic log for the next comparison. The version is recorded in `extension_loaded`.
+
+## Release history
+
+The following sections describe earlier versions; 0.7.4 supersedes their acceptance and retention rules.
+
+## 0.7.3: ceiling-relative re-arm hysteresis
+
+Automatic Jev still gets one attempt when Pi usage exceeds `contextWindow - reserveTokens`. Re-arming now requires meaningful headroom **below that ceiling**, instead of falling to a fixed 70% of the window:
+
+```text
+ceiling = max(0, contextWindow - reserveTokens)
+margin  = min(contextWindow * 0.05, reserveTokens / 2)
+rearm   = max(0, floor(ceiling - margin))
+```
+
+With Pi's default 16,384-token reserve:
+
+| Context window | Automatic trigger above | Re-arm at or below | Re-arm % |
+| ---: | ---: | ---: | ---: |
+| 32,768 | 16,384 | 14,745 | ~45.00% |
+| 65,536 | 49,152 | 45,875 | ~70.00% |
+| 112,640 | 96,256 | 90,624 | ~80.45% |
+| 262,144 | 245,760 | 237,568 | ~90.63% |
+
+After accepted pruning, the next completed provider turn decides:
+
+- **Usage <= re-arm boundary:** arm Jev for a future ceiling crossing.
+- **Re-arm boundary < usage <= ceiling:** keep pruning, remain disarmed, and continue normally. Native compaction wins at the next ceiling crossing unless usage later falls to the re-arm boundary.
+- **Usage > ceiling:** remain disarmed and let native compaction proceed.
+- **Failed/aborted response, missing positive provider usage, or unavailable Pi usage:** exhaust validation rather than treating stale usage as proof of headroom. Jev evaluations wait for a successful turn with positive usage.
+
+Re-arming also requires usage strictly below the native ceiling. With a zero reserve there is no hysteresis margin, but usage at/above the ceiling still cannot re-arm; a zero ceiling cannot re-arm at all. Boundaries are resolved again from the active model and Pi settings on every check.
+
+Pi's usage signal is provider-backed plus Pi's estimates for trailing messages (including newly completed tool results), not a tokenizer measurement of every message. Extension-local token estimates remain diagnostic/Jev-budgeting only.
+
+This release deliberately leaves scoring defaults, acceptance of any actual pruning, manual refresh, and native fallback unchanged. It adds **no token-growth override**. Reload/resume/tree restoration still restores committed pruning but starts a new armed episode; use fresh sessions without mid-run reloads when comparing policies.
+
+### Running the next comparison
+
+Start new Pi workers (or `/reload` idle interactive sessions) to load 0.7.3. Ensure each worker inherits `TYPESAFE_API_KEY`. Keep diagnostics enabled and do not clear the existing log: `extension_loaded.version` distinguishes old and new runs.
+
+`/jev-status` shows the resolved re-arm tokens, percentage, and hysteresis gap. Diagnostics now include:
+
+- `session_start`: session ID, provider/model, and API-key presence **only**, never its value.
+- Context/evaluation/validation records: `rearmTokens`, derived `rearmPercent`, `hysteresisMarginTokens`, and `headroomTokens` (negative above the ceiling).
+- Turn checks/validation: `freshUsage`; missing validation has outcome `jev_validation_usage_unavailable`.
+- Existing new-eligible-result volume, provider cache usage, and native-compaction events remain available for comparing reclaimed runway against cache cost.
+
+The 5%-of-window / half-reserve margin is an initial calibration to evaluate against real runs, not a claim of optimality.
+
 ## 0.7.2: pressure re-arm hysteresis
 
 0.7.2 keeps 0.7.1's one-attempt pressure episodes and adds one simple hysteresis rule: an automatic Jev episode is not re-armed until Pi's real context usage is at or below **70%**.
@@ -28,7 +118,7 @@ validation usage > 70%
 
 This prevents edge oscillation such as a tiny prune moving usage from 86% to 84%, re-arming Jev, then triggering another prefix-invalidating pass a few turns later. There is still no minimum reduction percentage: even a small accepted prune may remain useful, but it no longer earns another automatic Jev episode unless the real post-turn context reaches the lower hysteresis boundary.
 
-The 70% re-arm value is context-size independent. With Pi's default reserve it gives a real dead band on 65k contexts (native ceiling ~75%) and a larger dead band on 112k contexts (native ceiling ~85.5%).
+The fixed 70% value gave a ~5-point dead band on 65k contexts but a ~15.5-point gap on 112k contexts. This scaling distortion, and its ability to exceed the native ceiling on smaller windows or larger reserves, is why 0.7.3 replaces it.
 
 ## 0.7.1: single-attempt pressure episodes
 

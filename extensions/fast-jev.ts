@@ -16,10 +16,16 @@ import {
   type ToolCall as JevToolCall,
 } from "./fast-jev-core.ts";
 import { Diagnostics, summarizeDiagnostic } from "./diagnostics.ts";
+import { scoringDiagnostics } from "./scoring-diagnostics.ts";
 import {
-  acceptsReduction,
+  MAX_TASK_EXCERPT_CHARS,
+  MAX_TASK_EXCERPTS_TOTAL_CHARS,
+  statusDocumentExcerpt,
+} from "./task-excerpts.ts";
+import {
+  pruningAcceptance,
   activeRunAction,
-  PRESSURE_REARM_PERCENT,
+  hasFreshAssistantUsage,
   realContextBoundary,
   reconcilePressureEpisode,
   shouldCancelNativeThreshold,
@@ -69,6 +75,8 @@ interface CachedDecision {
   action: CallAction;
   keepCall: number;
   keepResult: number;
+  /** Bounded historical status-document text, fixed when pruning is committed. */
+  retainedExcerpt?: string;
 }
 
 interface PersistedDecision extends CachedDecision {
@@ -165,6 +173,9 @@ interface RuntimeState {
   lastReserveTokens?: number;
   lastCeilingTokens?: number;
   lastAutoCompactionEnabled?: boolean;
+  lastEstimatedSavedTokens?: number;
+  lastMinimumSavedTokens?: number | null;
+  lastAcceptanceReason?: string;
 }
 
 function envNumber(name: string, fallback: number): number {
@@ -411,7 +422,7 @@ function applyDecisionsDetailed(
       }
       if (decision?.action === "drop_result") {
         const original = textContent(message.content);
-        const pruned = prunedResultText(original, message.isError);
+        const pruned = decision.retainedExcerpt ?? prunedResultText(original, message.isError);
         if (pruned !== original) {
           prunedResults += 1;
           output.push({
@@ -530,10 +541,50 @@ function mergeMonotonicDecisions(
     if (!rawIds.has(id)) continue;
     const previous = merged.get(id);
     if (!previous || ACTION_RANK[next.action] >= ACTION_RANK[previous.action]) {
-      merged.set(id, next);
+      merged.set(id, previous?.retainedExcerpt && next.action === "drop_result"
+        ? { ...next, retainedExcerpt: previous.retainedExcerpt }
+        : next);
     }
   }
   return merged;
+}
+
+/** Attach excerpts only to newly pruned, still-visible status-document reads. */
+function retainTaskExcerpts(
+  messages: readonly AgentMessage[],
+  calls: readonly JevToolCall[],
+  proposed: Map<string, CachedDecision>,
+  existing: ReadonlyMap<string, CachedDecision>,
+): void {
+  let remaining = MAX_TASK_EXCERPTS_TOTAL_CHARS - [...proposed.values()]
+    .reduce((sum, decision) => sum + (decision.retainedExcerpt?.length ?? 0), 0);
+  const callById = new Map(calls.map(call => [call.tool_use_id, call]));
+  // Prefer newer documents within this pass; committed excerpts remain stable.
+  for (let i = messages.length - 1; i >= 0 && remaining > 0; i--) {
+    const message = messages[i]!;
+    if (message.role !== "toolResult" || message.isError) continue;
+    const id = message.toolCallId;
+    const decision = proposed.get(id);
+    const previous = existing.get(id);
+    if (decision?.action !== "drop_result" || decision.retainedExcerpt ||
+        (previous && previous.action !== "keep")) continue;
+    const call = callById.get(id);
+    if (call?.tool.toLowerCase() !== "read") continue;
+    const path = call.input.path ?? call.input.file_path;
+    if (typeof path !== "string") continue;
+    const retainedExcerpt = statusDocumentExcerpt(path, textContent(message.content), remaining);
+    if (!retainedExcerpt) continue;
+    proposed.set(id, { ...decision, retainedExcerpt });
+    remaining -= retainedExcerpt.length;
+  }
+}
+
+function excerptStats(decisions: ReadonlyMap<string, CachedDecision>): { results: number; chars: number } {
+  const excerpts = [...decisions.values()].filter(decision => decision.retainedExcerpt);
+  return {
+    results: excerpts.length,
+    chars: excerpts.reduce((sum, decision) => sum + decision.retainedExcerpt!.length, 0),
+  };
 }
 
 function persistedState(state: RuntimeState, cause: string): PersistedLogicalState {
@@ -565,6 +616,7 @@ function persistLogicalState(
       decisions: data.decisions.length,
       droppedCalls: data.decisions.filter((decision) => decision.action === "drop_call").length,
       droppedResults: data.decisions.filter((decision) => decision.action === "drop_result").length,
+      retainedTaskExcerpts: excerptStats(state.decisions),
     });
   } catch (error) {
     diagnostics.record("logical_state_persist_failed", { cause, error: errorText(error) });
@@ -585,14 +637,22 @@ function restoreLogicalState(
   }
 
   const restored = new Map<string, CachedDecision>();
+  let excerptChars = 0;
   for (const decision of saved?.decisions ?? []) {
     if (!decision || typeof decision.toolCallId !== "string") continue;
     if (!(["keep", "drop_result", "drop_call"] as string[]).includes(decision.action)) continue;
     if (typeof decision.keepCall !== "number" || typeof decision.keepResult !== "number") continue;
+    const retainedExcerpt = decision.action === "drop_result" &&
+      typeof decision.retainedExcerpt === "string" &&
+      decision.retainedExcerpt.length <= MAX_TASK_EXCERPT_CHARS &&
+      excerptChars + decision.retainedExcerpt.length <= MAX_TASK_EXCERPTS_TOTAL_CHARS
+      ? decision.retainedExcerpt : undefined;
+    if (retainedExcerpt) excerptChars += retainedExcerpt.length;
     restored.set(decision.toolCallId, {
       action: decision.action,
       keepCall: decision.keepCall,
       keepResult: decision.keepResult,
+      ...(retainedExcerpt ? { retainedExcerpt } : {}),
     });
   }
 
@@ -604,6 +664,9 @@ function restoreLogicalState(
   state.restoredDecisionCount = restored.size;
   state.lastResult = undefined;
   state.lastEffectiveReduction = undefined;
+  state.lastEstimatedSavedTokens = undefined;
+  state.lastMinimumSavedTokens = undefined;
+  state.lastAcceptanceReason = undefined;
   state.lastEvaluationMode = undefined;
   state.lastError = undefined;
   state.insufficient = false;
@@ -613,6 +676,7 @@ function restoreLogicalState(
   state.breakerUntilMs = 0;
   diagnostics.record("logical_state_restored", {
     decisions: restored.size,
+    retainedTaskExcerpts: excerptStats(restored),
     savedAt: saved?.savedAt,
     cause: saved?.cause,
   });
@@ -671,6 +735,20 @@ function piCompactionBoundary(ctx: ExtensionContext): PiCompactionBoundary {
       contextWindow: usage?.contextWindow ?? ctx.model?.contextWindow,
       reserveTokens: settings.reserveTokens,
     }),
+  };
+}
+
+function rearmDiagnostics(boundary: RealContextBoundary | null): Record<string, number | null> {
+  return {
+    rearmTokens: boundary?.rearmTokens ?? null,
+    rearmPercent: boundary
+      ? Number(((boundary.rearmTokens / boundary.contextWindow) * 100).toFixed(2))
+      : null,
+    hysteresisMarginTokens: boundary?.hysteresisMarginTokens ?? null,
+    headroomTokens:
+      boundary?.tokens === null || boundary?.tokens === undefined
+        ? null
+        : boundary.ceilingTokens - boundary.tokens,
   };
 }
 
@@ -796,11 +874,21 @@ async function evaluate(
   }, config.evaluationTimeoutMs);
 
   try {
+    const goal = config.goal ?? inferGoal(sourceMessages);
+    const prompts = sourceMessages.filter(message => message.role === "user")
+      .map(message => textContent(message.content).trim()).filter(Boolean).slice(-3);
+    diagnostics.record("evaluation_goal", {
+      source: config.goal === undefined ? "recent_user_prompts" : "configured",
+      goalChars: goal.length,
+      sourcePromptChars: prompts.map(prompt => prompt.length),
+      truncatedPrompts: config.goal === undefined ? prompts.filter(prompt => prompt.length > 500).length : 0,
+      resultVisibility: "metadata_only",
+    });
     const compaction = compactMessages(projected.messages, {
       apiKey: process.env.TYPESAFE_API_KEY,
       model: config.model,
       baseUrl: config.baseUrl,
-      goal: config.goal ?? inferGoal(sourceMessages),
+      goal,
       keepThreshold: config.keepThreshold,
       preserveRecentMessages: config.preserveRecentMessages,
       protectedToolUseIds: projected.protectedToolCallIds,
@@ -842,7 +930,7 @@ function updateStatus(ctx: ExtensionContext, state: RuntimeState): void {
   }
   const context = state.lastPiPercent === undefined ? "" : ` · ${state.lastPiPercent.toFixed(0)}% ctx`;
   if (state.active) {
-    ctx.ui.setStatus(STATUS_KEY, `Jev armed${context}`);
+    ctx.ui.setStatus(STATUS_KEY, `Jev ${state.pressureEpisode}${context}`);
     return;
   }
   if (state.decisions.size > 0) {
@@ -1025,6 +1113,7 @@ async function evaluateAtTurnEnd(
   diagnostics: Diagnostics,
   state: RuntimeState,
   turnIndex: number,
+  freshUsage: boolean,
 ): Promise<void> {
   if (!state.enabled) return;
 
@@ -1078,23 +1167,30 @@ async function evaluateAtTurnEnd(
   const episodeBeforeReconcile = state.pressureEpisode;
   state.pressureEpisode = reconcilePressureEpisode({
     state: state.pressureEpisode,
-    usagePercent: boundary?.percent ?? null,
+    boundary: freshUsage ? boundary : null,
   });
   if (episodeBeforeReconcile === "awaiting_validation") {
     diagnostics.record("pressure_episode_validated", {
       turnIndex,
       outcome:
-        state.pressureEpisode === "armed"
-          ? "jev_restored_rearm_headroom"
-          : boundary?.overCeiling
-            ? "jev_failed_to_restore_ceiling"
-            : "jev_below_ceiling_but_disarmed",
+        !freshUsage || boundary?.tokens === null || !boundary
+          ? "jev_validation_usage_unavailable"
+          : state.pressureEpisode === "armed"
+            ? "jev_restored_rearm_headroom"
+            : boundary.overCeiling
+              ? "jev_failed_to_restore_ceiling"
+              : "jev_below_ceiling_but_disarmed",
       usageTokens: boundary?.tokens ?? null,
       usagePercent:
         boundary?.percent === null || boundary?.percent === undefined
           ? null
           : Number(boundary.percent.toFixed(2)),
-      rearmPercent: PRESSURE_REARM_PERCENT,
+      ...rearmDiagnostics(boundary),
+      freshUsage,
+      contextWindow: boundary?.contextWindow ?? null,
+      reserveTokens: piBoundary.reserveTokens,
+      newEligibleCalls: newEligibleIds.size,
+      newEligibleResultTokens,
       ceilingTokens: boundary?.ceilingTokens ?? null,
       overCeiling: boundary?.overCeiling ?? null,
     });
@@ -1109,7 +1205,7 @@ async function evaluateAtTurnEnd(
         boundary?.percent === null || boundary?.percent === undefined
           ? null
           : Number(boundary.percent.toFixed(2)),
-      rearmPercent: PRESSURE_REARM_PERCENT,
+      ...rearmDiagnostics(boundary),
       ceilingTokens: boundary?.ceilingTokens ?? null,
     });
   }
@@ -1120,7 +1216,7 @@ async function evaluateAtTurnEnd(
   );
 
   const forceRefresh = state.forceRefresh;
-  const shouldEvaluate = shouldEvaluateAtTurnEnd({
+  const shouldEvaluate = freshUsage && shouldEvaluateAtTurnEnd({
     autoCompactionEnabled: piBoundary.autoCompactionEnabled,
     overCeiling: boundary?.overCeiling ?? false,
     pressureEpisode: state.pressureEpisode,
@@ -1152,7 +1248,8 @@ async function evaluateAtTurnEnd(
     committed: state.decisions.size,
     deferredDropCalls: state.deferredDropCalls.size,
     pressureEpisode: state.pressureEpisode,
-    rearmPercent: PRESSURE_REARM_PERCENT,
+    freshUsage,
+    ...rearmDiagnostics(boundary),
   });
 
   if (!shouldEvaluate) {
@@ -1234,6 +1331,8 @@ async function evaluateAtTurnEnd(
     newEligibleCalls: newEligibleIds.size,
     newEligibleResultTokens,
     timeoutMs: config.evaluationTimeoutMs,
+    contextWindow: boundary?.contextWindow ?? null,
+    ...rearmDiagnostics(boundary),
   });
 
   try {
@@ -1249,24 +1348,46 @@ async function evaluateAtTurnEnd(
     state.lastEvaluatedEligibleIds = new Set(eligibleNow);
     const upstreamRatio = reductionRatio(evaluation.result);
     const activeMaps = activeDecisionMaps(evaluation.result, evaluation.calls);
-    const effectiveRatio = activeReductionRatio(
-      logicalBefore,
-      activeMaps.committed,
-    );
+    const beforeMerge = new Map(state.decisions);
+    const proposedDecisions = mergeMonotonicDecisions(beforeMerge, activeMaps.committed, rawIds);
+    retainTaskExcerpts(logicalBefore, evaluation.calls, proposedDecisions, beforeMerge);
+    const effectiveRatio = activeReductionRatio(logicalBefore, proposedDecisions);
     const proposedApply = applyDecisionsDetailed(
       logicalBefore,
-      activeMaps.committed,
-      decisionIds(activeMaps.committed),
+      proposedDecisions,
+      decisionIds(proposedDecisions),
     );
     const changedResults =
       proposedApply.stats.droppedCalls +
       proposedApply.stats.droppedResults +
       proposedApply.stats.prunedResults;
-    const accepted = acceptsReduction(changedResults);
-    const beforeMerge = new Map(state.decisions);
+    // Count only the net change to already-logical tool-result contents. Raw
+    // transcript size and Jev's hypothetical full call deletions are irrelevant
+    // to active-run savings. Retained notes/markers are charged to this budget.
+    const afterProjection = projectMessages(proposedApply.messages);
+    const allResultIds = new Set(calls.map(call => call.tool_use_id));
+    const estimatedSavedTokens = Math.max(0,
+      toolResultTokenVolume(projection.messages, allResultIds) -
+      toolResultTokenVolume(afterProjection.messages, allResultIds));
+    const acceptance = pruningAcceptance({
+      changedResults, estimatedSavedTokens, automatic: !forceRefresh, boundary,
+    });
+    const { accepted } = acceptance;
+    state.lastEstimatedSavedTokens = estimatedSavedTokens;
+    state.lastMinimumSavedTokens = acceptance.minimumSavedTokens;
+    state.lastAcceptanceReason = acceptance.reason;
+    const previouslyPrunedIds = new Set(evaluation.calls
+      .filter(call => {
+        const previous = beforeMerge.get(call.tool_use_id);
+        return previous && previous.action !== "keep";
+      }).map(call => call.id));
+    diagnostics.record("evaluation_scores", {
+      turnIndex,
+      ...scoringDiagnostics(evaluation.result.decisions, previouslyPrunedIds, config.keepThreshold),
+    });
 
     if (accepted) {
-      state.decisions = mergeMonotonicDecisions(beforeMerge, activeMaps.committed, rawIds);
+      state.decisions = proposedDecisions;
 
       // Only the latest accepted evaluation controls which full deletions are
       // eligible for promotion at agent_end. Until then every such call remains
@@ -1275,7 +1396,9 @@ async function evaluateAtTurnEnd(
         if (!call.pinned) state.deferredDropCalls.delete(call.tool_use_id);
       }
       for (const [id, decision] of activeMaps.deferredDropCalls) {
-        if (rawIds.has(id)) state.deferredDropCalls.set(id, decision);
+        if (rawIds.has(id) && !state.decisions.get(id)?.retainedExcerpt) {
+          state.deferredDropCalls.set(id, decision);
+        }
       }
 
       persistLogicalState(pi, diagnostics, state, "turn_end_result_only");
@@ -1330,6 +1453,11 @@ async function evaluateAtTurnEnd(
       evaluatedEligibleBaseline: state.lastEvaluatedEligibleIds.size,
       newEligibleResultTokens,
       changedResults,
+      estimatedSavedTokens,
+      minimumSavedTokens: acceptance.minimumSavedTokens,
+      acceptanceReason: acceptance.reason,
+      proposedTaskExcerpts: excerptStats(proposedDecisions),
+      retainedTaskExcerpts: excerptStats(state.decisions),
       pressureEpisode: state.pressureEpisode,
       automaticPressureAttempt,
       actions: countActions(evaluation.result),
@@ -1387,9 +1515,12 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
   };
 
   diagnostics.record("extension_loaded", {
-    version: "0.7.2",
-    thresholdMode: "pi_real_usage_pressure_hysteresis",
-    rearmPercent: PRESSURE_REARM_PERCENT,
+    version: "0.7.4",
+    thresholdMode: "pi_ceiling_relative_hysteresis",
+    automaticSavingsGate: "estimated_net_result_savings >= hysteresisMarginTokens",
+    taskExcerptChars: MAX_TASK_EXCERPT_CHARS,
+    taskExcerptTotalChars: MAX_TASK_EXCERPTS_TOTAL_CHARS,
+    rearmFormula: "max(0, floor(ceiling - min(window * 0.05, reserve / 2)))",
     requestTimeoutMs: config.requestTimeoutMs,
     evaluationTimeoutMs: config.evaluationTimeoutMs,
     circuitBreakerFailures: config.circuitBreakerFailures,
@@ -1399,7 +1530,14 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
 
   pi.on("session_start", (event, ctx) => {
     restoreLogicalState(ctx, diagnostics, state);
-    diagnostics.record("session_start", { reason: event.reason, restored: state.decisions.size });
+    diagnostics.record("session_start", {
+      reason: event.reason,
+      restored: state.decisions.size,
+      sessionId: ctx.sessionManager.getSessionId(),
+      provider: ctx.model?.provider,
+      model: ctx.model?.id,
+      apiKeyConfigured: Boolean(process.env.TYPESAFE_API_KEY?.trim()),
+    });
     updateStatus(ctx, state);
   });
 
@@ -1506,6 +1644,7 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
         overCeiling: boundary?.overCeiling ?? null,
         autoCompactionEnabled: piBoundary.autoCompactionEnabled,
         pressureEpisode: state.pressureEpisode,
+        ...rearmDiagnostics(boundary),
         ...applied.stats,
         durationMs: Date.now() - hookStarted,
       });
@@ -1557,6 +1696,7 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
           reserveTokens: piBoundary.reserveTokens,
           ceilingTokens: boundary?.ceilingTokens ?? null,
           pressureEpisode: state.pressureEpisode,
+          ...rearmDiagnostics(boundary),
           committed: state.decisions.size,
           deferredDropCalls: state.deferredDropCalls.size,
           thresholdCancelledCount: state.thresholdCancelledCount,
@@ -1598,6 +1738,7 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
         reserveTokens: piBoundary.reserveTokens,
         ceilingTokens: boundary?.ceilingTokens ?? null,
         pressureEpisode: state.pressureEpisode,
+        ...rearmDiagnostics(boundary),
         lastError: state.lastError,
         sanitized,
         thresholdPassedCount: state.thresholdPassedCount,
@@ -1626,6 +1767,9 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
     state.insufficient = false;
     state.lastError = undefined;
     state.lastResult = undefined;
+    state.lastEstimatedSavedTokens = undefined;
+    state.lastMinimumSavedTokens = undefined;
+    state.lastAcceptanceReason = undefined;
     state.pressureEpisode = "armed";
     state.lastEvaluatedEligibleIds.clear();
     state.lastNewEligibleResultTokens = undefined;
@@ -1669,6 +1813,10 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
 
   const showStatus = (ctx: ExtensionContext): void => {
     const result = state.lastResult;
+    const boundary = piCompactionBoundary(ctx).boundary;
+    const rearmLabel = boundary
+      ? `${boundary.rearmTokens.toLocaleString()} tokens (${(boundary.rearmTokens / boundary.contextWindow * 100).toFixed(2)}%) · hysteresis=${boundary.hysteresisMarginTokens.toLocaleString()} tokens`
+      : "unknown";
     const breakerRemaining = Math.max(0, state.breakerUntilMs - Date.now());
     const rawWindow = state.lastContextWindow && state.lastContextWindow > 0
       ? ` / ${formatTokens(state.lastContextWindow)}`
@@ -1685,6 +1833,7 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
     const logicalContext = state.lastLogicalTokens !== undefined
       ? `${formatTokens(state.lastLogicalTokens)}${rawWindow} (${(state.lastLogicalPercent ?? 0).toFixed(1)}%)`
       : `unknown${rawWindow}`;
+    const retained = excerptStats(state.decisions);
     const lines = [
       `fast-jev-compaction: enabled=${state.enabled} · at-threshold=${state.active} · evaluating=${state.evaluating}`,
       `context: Pi≈${piContext} · Pi ceiling=${state.lastCeilingTokens === undefined ? "unknown" : formatTokens(state.lastCeilingTokens)} · reserve=${state.lastReserveTokens === undefined ? "unknown" : formatTokens(state.lastReserveTokens)} · auto-compaction=${state.lastAutoCompactionEnabled ?? "unknown"}`,
@@ -1692,10 +1841,12 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
       `persisted Pi transcript≈${formatTokens(state.lastRawTokens ?? 0)}${rawWindow} (${(state.lastRawPercent ?? 0).toFixed(1)}%) · calls=${state.lastGrossToolCalls ?? "n/a"}; diagnostic only`,
       `committed decisions: ${state.decisions.size} total · drop_call=${committedDropCalls} · drop_result=${committedDropResults} · keep=${committedKeeps} · deferred drop_call=${state.deferredDropCalls.size} · restored=${state.restoredDecisionCount}`,
       `evaluations: ${state.evaluationSuccesses}/${state.evaluationAttempts} successful · Jev HTTP requests=${state.totalHttpRequests} total${state.lastEvaluationRequests !== undefined ? ` (last pass=${state.lastEvaluationRequests})` : ""}`,
-      `pressure episode: ${state.pressureEpisode} · re-arm≤${PRESSURE_REARM_PERCENT}% · new eligible result≈${formatTokens(state.lastNewEligibleResultTokens ?? 0)} tokens · baseline calls=${state.lastEvaluatedEligibleIds.size}`,
+      `pressure episode: ${state.pressureEpisode} · re-arm≤${rearmLabel} · new eligible result≈${formatTokens(state.lastNewEligibleResultTokens ?? 0)} tokens · baseline calls=${state.lastEvaluatedEligibleIds.size}`,
       result
         ? `last pass: mode=${state.lastEvaluationMode ?? "n/a"} · effective reduction=${state.lastEffectiveReduction === undefined ? "n/a" : percent(state.lastEffectiveReduction)} · upstream=${percent(reductionRatio(result))} · eligible=${state.lastEvaluationEligible ?? "n/a"} · ${state.lastEvaluationMs ?? "n/a"}ms · Jev state≈${formatTokens(result.stats.stateTokens)} (${result.stats.stateStage || "n/a"})`
         : "last pass: n/a",
+      `automatic savings floor: ${boundary ? formatTokens(boundary.hysteresisMarginTokens) : "unknown"} estimated net result tokens · last proposed saving=${state.lastEstimatedSavedTokens === undefined ? "n/a" : formatTokens(state.lastEstimatedSavedTokens)} · last required=${state.lastMinimumSavedTokens ?? "n/a"} · outcome=${state.lastAcceptanceReason ?? "n/a"}`,
+      `task excerpts: ${retained.results} results · ${retained.chars}/${MAX_TASK_EXCERPTS_TOTAL_CHARS} chars · historical notes, not current source`,
       `last apply: ${lastApply}`,
       state.lastHttp
         ? `last HTTP: ${state.lastHttp.status ?? "error"} · ${state.lastHttp.durationMs}ms${state.lastHttp.timedOut ? " · timeout" : ""}`
@@ -1751,7 +1902,7 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
       content?: Array<{ type?: string; text?: string }>;
       stopReason?: string;
       rawStopReason?: string;
-      usage?: { input?: number; output?: number; totalTokens?: number; cacheRead?: number };
+      usage?: { input?: number; output?: number; totalTokens?: number; cacheRead?: number; cacheWrite?: number };
     };
     const blocks = Array.isArray(message.content) ? message.content : [];
     const contentTypes = blocks.map((block) => block.type ?? "unknown");
@@ -1776,7 +1927,9 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
       providerDurationMs: state.lastProviderDurationMs,
     });
 
-    await evaluateAtTurnEnd(pi, ctx, config, diagnostics, state, event.turnIndex);
+    await evaluateAtTurnEnd(
+      pi, ctx, config, diagnostics, state, event.turnIndex, hasFreshAssistantUsage(message),
+    );
   });
 
   pi.on("agent_end", (event, ctx) => {
@@ -1808,7 +1961,7 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
     let promoted = 0;
 
     for (const [id, deferred] of state.deferredDropCalls) {
-      if (!rawIds.has(id)) continue;
+      if (!rawIds.has(id) || state.decisions.get(id)?.retainedExcerpt) continue;
       const next: CachedDecision = { ...deferred, action: "drop_call" };
       const previous = state.decisions.get(id);
       if (!previous || ACTION_RANK[next.action] > ACTION_RANK[previous.action]) {
