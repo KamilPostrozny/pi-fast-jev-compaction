@@ -430,6 +430,17 @@ The package is self-contained and has no runtime npm dependencies, so `npm insta
 export TYPESAFE_API_KEY="..."
 ```
 
+### OpenRouter scorer (single-key setup)
+
+If you already use `@robhowley/pi-openrouter` for models, the same `OPENROUTER_API_KEY` can drive compaction too:
+
+```bash
+export OPENROUTER_API_KEY="..."
+export PI_JEV_PROVIDER=openrouter
+# optional: pick a specific scorer model
+# export PI_JEV_MODEL=openrouter/free
+```
+
 ## Recommended starting configuration
 
 ```bash
@@ -442,11 +453,12 @@ export PI_JEV_DIAGNOSTICS=1
 
 | Variable | Default | Meaning |
 | --- | ---: | --- |
+| `PI_JEV_PROVIDER` | `typesafe` | Scorer backend: `typesafe` (System One + `TYPESAFE_API_KEY`) or `openrouter` (OpenRouter chat completions + `OPENROUTER_API_KEY`) |
 | `PI_JEV_KEEP_THRESHOLD` | `0.5` | Jev keep-probability threshold |
 | `PI_JEV_PRESERVE_RECENT_MESSAGES` | `6` | Newest messages in the **logical** transcript protected from pruning |
 | `PI_JEV_MAX_STATE_TOKENS` | `25000` | Jev state budget |
 | `PI_JEV_MAX_REQUEST_TOKENS` | `30000` | Jev request budget |
-| `PI_JEV_MODEL` | `jev-latest` | TypeSafe Jev model |
+| `PI_JEV_MODEL` | `jev-latest` (TypeSafe) / `openrouter/free` (OpenRouter) | Jev scorer model |
 | `PI_JEV_BASE_URL` | upstream default | Override TypeSafe System One endpoint |
 | `PI_JEV_GOAL` | recent user prompts | Fixed goal override sent to Jev |
 | `PI_JEV_REQUEST_TIMEOUT_MS` | `8000` | Deadline for one Jev HTTP request |
