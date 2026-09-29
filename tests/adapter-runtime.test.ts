@@ -6,6 +6,7 @@ import * as core from "../extensions/fast-jev-core.ts";
 import * as policy from "../extensions/policy.ts";
 import * as excerpts from "../extensions/task-excerpts.ts";
 import * as scoring from "../extensions/scoring-diagnostics.ts";
+import * as openrouter from "../extensions/openrouter-asker.ts";
 
 // Execute the actual adapter with fake Pi services, real policy/core, and mocked
 // Jev HTTP. No installed Pi packages, credentials, network, or log writes needed.
@@ -101,6 +102,7 @@ function harness(t: TestContext, options: { window?: number; reserve?: number; e
     "./policy.ts": policy,
     "./task-excerpts.ts": excerpts,
     "./scoring-diagnostics.ts": scoring,
+    "./openrouter-asker.ts": openrouter,
   });
   factory(pi);
   const emit = (event: string, data: RecordData = {}) => handlers.get(event)!(data, ctx);

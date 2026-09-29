@@ -7,6 +7,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import {
   collectToolCalls,
+  compact,
   compactMessages,
   estimateTokens,
   reductionRatio,
@@ -15,6 +16,7 @@ import {
   type Message as JevMessage,
   type ToolCall as JevToolCall,
 } from "./fast-jev-core.ts";
+import { OpenRouterJevClient, OPENROUTER_DEFAULT_MODEL } from "./openrouter-asker.ts";
 import { Diagnostics, summarizeDiagnostic } from "./diagnostics.ts";
 import { scoringDiagnostics } from "./scoring-diagnostics.ts";
 import {
@@ -44,6 +46,7 @@ export interface Config {
   maxStateTokens: number;
   maxRequestTokens: number;
   model: string;
+  provider: "typesafe" | "openrouter";
   baseUrl?: string;
   goal?: string;
   requestTimeoutMs: number;
@@ -62,6 +65,7 @@ const DEFAULTS: Config = {
   maxStateTokens: 25_000,
   maxRequestTokens: 30_000,
   model: "jev-latest",
+  provider: "typesafe",
   requestTimeoutMs: 8_000,
   evaluationTimeoutMs: 12_000,
   retryDelayMs: 30_000,
@@ -207,6 +211,7 @@ export function resolveConfig(): Config {
     requestTimeoutMs + 1_000,
     Math.floor(envNumber("PI_JEV_EVALUATION_TIMEOUT_MS", DEFAULTS.evaluationTimeoutMs)),
   );
+  const provider = envString("PI_JEV_PROVIDER")?.toLowerCase();
   const config: Config = {
     keepThreshold: envNumber("PI_JEV_KEEP_THRESHOLD", DEFAULTS.keepThreshold),
     preserveRecentMessages: Math.max(
@@ -215,6 +220,7 @@ export function resolveConfig(): Config {
     ),
     maxStateTokens: Math.max(1, envNumber("PI_JEV_MAX_STATE_TOKENS", DEFAULTS.maxStateTokens)),
     maxRequestTokens: Math.max(1, envNumber("PI_JEV_MAX_REQUEST_TOKENS", DEFAULTS.maxRequestTokens)),
+    provider: provider === "openrouter" ? "openrouter" : "typesafe",
     model: envString("PI_JEV_MODEL") ?? DEFAULTS.model,
     requestTimeoutMs,
     evaluationTimeoutMs,
@@ -236,10 +242,17 @@ export function resolveConfig(): Config {
   const baseUrl = envString("PI_JEV_BASE_URL");
   const goal = envString("PI_JEV_GOAL");
   const diagnosticsFile = envString("PI_JEV_DIAGNOSTICS_FILE");
+  if (config.provider === "openrouter" && !envString("PI_JEV_MODEL")) config.model = OPENROUTER_DEFAULT_MODEL;
   if (baseUrl) config.baseUrl = baseUrl;
   if (goal) config.goal = goal;
   if (diagnosticsFile) config.diagnosticsFile = diagnosticsFile;
   return config;
+}
+
+function jevApiKey(config: Config): string {
+  return config.provider === "openrouter"
+    ? process.env.OPENROUTER_API_KEY?.trim() ?? ""
+    : process.env.TYPESAFE_API_KEY?.trim() ?? "";
 }
 
 function textContent(content: unknown): string {
@@ -884,7 +897,23 @@ async function evaluate(
       truncatedPrompts: config.goal === undefined ? prompts.filter(prompt => prompt.length > 500).length : 0,
       resultVisibility: "metadata_only",
     });
-    const compaction = compactMessages(projected.messages, {
+    const compaction =
+      config.provider === "openrouter"
+        ? compact(projected.messages, new OpenRouterJevClient({
+            apiKey: jevApiKey(config),
+            model: config.model,
+            baseUrl: config.baseUrl,
+            fetch: makeDiagnosticFetch(diagnostics, config, controller.signal, state),
+          }), {
+          goal,
+          keepThreshold: config.keepThreshold,
+          preserveRecentMessages: config.preserveRecentMessages,
+          protectedToolUseIds: projected.protectedToolCallIds,
+          maxStateTokens: config.maxStateTokens,
+          maxRequestTokens: config.maxRequestTokens,
+          truncateHeadChars: 0,
+        })
+        : compactMessages(projected.messages, {
       apiKey: process.env.TYPESAFE_API_KEY,
       model: config.model,
       baseUrl: config.baseUrl,
@@ -1277,12 +1306,13 @@ async function evaluateAtTurnEnd(
     return;
   }
 
-  const key = process.env.TYPESAFE_API_KEY?.trim();
+  const key = jevApiKey(config);
   if (!key) {
-    state.lastError = "TYPESAFE_API_KEY is not configured";
+    const keyName = config.provider === "openrouter" ? "OPENROUTER_API_KEY" : "TYPESAFE_API_KEY";
+    state.lastError = `${keyName} is not configured`;
     state.insufficient = true;
     if (!state.notifiedMissingKey) {
-      notify(ctx, "fast-jev-compaction: TYPESAFE_API_KEY is not configured; Pi native compaction remains enabled", "warning");
+      notify(ctx, `fast-jev-compaction: ${keyName} is not configured; Pi native compaction remains enabled`, "warning");
       state.notifiedMissingKey = true;
     }
     diagnostics.record("evaluation_skipped", { turnIndex, reason: "missing_api_key" });
@@ -1536,7 +1566,9 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
       sessionId: ctx.sessionManager.getSessionId(),
       provider: ctx.model?.provider,
       model: ctx.model?.id,
-      apiKeyConfigured: Boolean(process.env.TYPESAFE_API_KEY?.trim()),
+      apiKeyConfigured: Boolean(jevApiKey(config)),
+      scorerProvider: config.provider,
+      scorerModel: config.model,
     });
     updateStatus(ctx, state);
   });

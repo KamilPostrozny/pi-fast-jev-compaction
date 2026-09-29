@@ -697,7 +697,7 @@ function count(decisions: readonly CallDecision[], reason: CallDecision["reason"
   return decisions.filter((decision) => decision.reason === reason).length;
 }
 
-async function compact(
+export async function compact(
   messages: readonly Message[],
   asker: JevAsker,
   options: CompactOptions = {},
